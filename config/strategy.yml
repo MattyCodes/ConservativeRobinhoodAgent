@@ -1,0 +1,52 @@
+# This file IS the strategy. Every value here is enforced in lib/guardrails.rb after Claude
+# responds. Changing a number here changes what the agent is allowed to do. Percentages are
+# whole numbers (7.0 == 7%).
+
+account:
+  cash_only: true          # reject the run if the Agentic account reports margin enabled
+  settlement_days: 1        # T+1; only settled proceeds count as deployable cash
+
+universe:
+  min_market_cap_usd: 10000000000   # 10B, large-cap only
+  min_avg_daily_volume: 1000000     # shares, 30-day average
+  min_price: 5                      # exclude sub-$5
+  min_listing_age_days: 180         # exclude recent IPOs (~6 months)
+  constituents_file: data/sp500.csv # symbol,name,sector — you maintain this
+
+sizing:
+  max_position_pct: 7.0             # of funded balance, per position
+  max_risk_per_trade_pct: 2.0      # of funded balance (position_pct * stop_loss_pct)
+  max_concurrent_positions: 10
+  max_sector_pct: 25.0             # of funded balance in any one GICS sector
+
+  # fractional_shares: true  -> entries are dollar-based MARKET orders (Robinhood requires
+  # type=market for fractional/dollar orders, regular hours only). This makes a small account
+  # usable, BUT Robinhood does not allow a native stop order on a fractional position, so the
+  # stop-loss becomes SCRIPT-MONITORED: it is only checked and acted on when a run happens.
+  # Between runs (overnight, weekends, a crashed/asleep machine) there is no stop protection.
+  # fractional_shares: false -> whole-share marketable-limit entries + native GTC stop_market.
+  fractional_shares: true
+  min_order_usd: 1.0               # Robinhood fractional minimum; skip if budget is below this
+
+entry:
+  ma_type: ema
+  ma_fast_period: 50
+  ma_slow_period: 200
+  rsi_period: 14
+  rsi_entry_max: 40                # only enter when RSI <= this (oversold-ish)
+  earnings_blackout_days: 3        # no new entry within N calendar days of an earnings date
+  trend_pullback_band_pct: 2.0     # trend entry: price must be within this % above the fast EMA
+  meanrev_support_band_pct: 3.0    # mean-reversion entry: price no more than this % below slow EMA
+  marketable_limit_slippage_bps: 10 # entry limit price = ask * (1 + bps/10000)
+
+exit:
+  stop_loss_pct: 7.0              # stop level this far below entry (native order if whole-share; else script-monitored)
+  profit_trigger_pct: 10.0       # once unrealized gain >= this, switch to a trailing stop
+  trail_pct: 7.0                 # trailing stop distance below high-water mark once triggered
+  time_exit_days: 30             # close if still open after N calendar days
+  no_average_down: true          # never add to a position already underwater
+
+pacing:
+  max_new_positions_per_day: 2
+  max_daily_deploy_pct: 25.0     # of available settled cash committable in one calendar day
+  stopout_cooldown_days: 3       # after a stop-out on a symbol, no re-entry for N days

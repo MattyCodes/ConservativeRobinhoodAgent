@@ -1,0 +1,14 @@
+# secrets / local config
+.env
+.env.*
+!.env.example
+HALT
+
+# runtime logs & state — may contain account numbers, balances, order history
+log/*
+!log/.gitkeep
+
+# misc
+.DS_Store
+*.gem
+.bundle/

@@ -13,6 +13,14 @@ class Strategy
 
   Proposal = Struct.new(:symbol, :rationale, :confidence, keyword_init: true)
 
+  # Always returned by #propose. On no_trade, `closest_miss` says how close the best candidate
+  # got - the instrument for judging whether the rules are too tight vs. the market just quiet.
+  Outcome = Struct.new(:action, :proposal, :closest_miss, :confidence, keyword_init: true) do
+    def enter?
+      action == "enter" && !proposal.nil?
+    end
+  end
+
   PROPOSE_TOOL = {
     name: "propose_trade",
     description: "Return exactly one conservative entry that satisfies every rule, or no_trade.",
@@ -22,8 +30,9 @@ class Strategy
       properties: {
         action: { type: "string", enum: %w[enter no_trade] },
         symbol: { type: "string", description: "Ticker to buy; required when action=enter." },
-        rationale: { type: "string", description: "Which entry rule is met and the specific evidence." },
-        confidence: { type: "number", minimum: 0, maximum: 1 }
+        rationale: { type: "string", description: "action=enter: which entry rule is met, with the numbers. action=no_trade: why nothing qualified." },
+        closest_miss: { type: "string", description: "action=no_trade only: the single candidate that came closest to qualifying and exactly what it missed by, e.g. 'MSFT: RSI 46, needs <=40; otherwise a clean trend pullback'. Empty string if nothing was remotely close." },
+        confidence: { type: "number", minimum: 0, maximum: 1, description: "Confidence in THIS decision (the enter, or the no_trade) - NOT a probability that trading is a good idea." }
       },
       required: %w[action rationale confidence]
     }
@@ -37,9 +46,9 @@ class Strategy
   # candidates: [{ symbol:, name:, sector:, technicals: {...} }]
   # portfolio:  { settled_cash:, funded_balance:, open_positions: [...], sector_exposure: {...},
   #               entries_today:, deployed_today:, cooldown_symbols: [...] }
-  # Returns Proposal or nil.
+  # Always returns an Outcome.
   def propose(candidates:, portfolio:)
-    return nil if candidates.empty?
+    return Outcome.new(action: "no_trade", proposal: nil, closest_miss: "", confidence: 1.0) if candidates.empty?
 
     body = {
       model: @config.claude_model,
@@ -50,17 +59,16 @@ class Strategy
       messages: [{ role: "user", content: user_prompt(candidates, portfolio) }]
     }
 
-    tool_input = request(body)
-    @log.("strategy: #{tool_input['action']} (confidence #{tool_input['confidence']})")
+    t = request(body)
+    confidence = t["confidence"].to_f
+    @log.("strategy: #{t['action']} (confidence #{confidence})")
 
-    return nil unless tool_input["action"] == "enter"
-    return nil if tool_input["symbol"].to_s.empty?
-
-    Proposal.new(
-      symbol: tool_input["symbol"].strip.upcase,
-      rationale: tool_input["rationale"].to_s,
-      confidence: tool_input["confidence"].to_f
-    )
+    if t["action"] == "enter" && !t["symbol"].to_s.empty?
+      proposal = Proposal.new(symbol: t["symbol"].strip.upcase, rationale: t["rationale"].to_s, confidence: confidence)
+      Outcome.new(action: "enter", proposal: proposal, closest_miss: "", confidence: confidence)
+    else
+      Outcome.new(action: "no_trade", proposal: nil, closest_miss: t["closest_miss"].to_s, confidence: confidence)
+    end
   end
 
   private
@@ -84,13 +92,18 @@ class Strategy
       PORTFOLIO STATE:
       #{JSON.pretty_generate(portfolio)}
 
-      CANDIDATES (already passed the eligibility screen; technicals on daily bars):
+      CANDIDATES (passed the eligibility screen; pre-ranked by pullback depth, deepest first;
+      technicals on daily bars):
       #{JSON.pretty_generate(candidates)}
 
       Call propose_trade with either one entry that satisfies every entry rule in section 3 and
-      violates no rule in sections 2, 5, or 6, or action=no_trade. Your rationale must name the
-      specific rule met (e.g. "mean-reversion: RSI 34 < 40 and price within 1% of rising 200-EMA")
-      and cite the numbers from the candidate data.
+      violates no rule in sections 2, 5, or 6, or action=no_trade. For an enter, the rationale
+      must name the specific rule met (e.g. "mean-reversion: RSI 34 < 40 and price within 1% of
+      rising 200-EMA") and cite the numbers.
+
+      For a no_trade, still fill in closest_miss: pick the ONE candidate that was nearest to
+      qualifying and state exactly what it missed by (which rule, current value vs threshold).
+      This is used to tell whether the rules are too tight or the market is just quiet.
     TXT
   end
 

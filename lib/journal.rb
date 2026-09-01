@@ -19,14 +19,14 @@ class Journal
 
   def record(event, **fields)
     row = { at: Time.now.utc.iso8601, event: event.to_s }.merge(fields)
-    File.open(@path, "a") { |f| f.puts(JSON.generate(row)) }
+    File.open(@path, "a:utf-8") { |f| f.puts(JSON.generate(row)) }
     row
   end
 
   def events
     return [] unless File.exist?(@path)
 
-    File.foreach(@path).map do |line|
+    File.foreach(@path, encoding: "bom|utf-8").map do |line|
       line = line.strip
       next if line.empty?
 

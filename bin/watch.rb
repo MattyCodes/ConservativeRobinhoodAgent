@@ -17,6 +17,10 @@ if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1")
   abort "Ruby >= 3.1 required (found #{RUBY_VERSION})."
 end
 
+# UTF-8 regardless of the ambient locale (see main.rb).
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+
 require_relative "../lib/agent"
 
 RUN_DAYS = (1..5).to_a          # Mon-Fri (Time#wday: 0 = Sunday)

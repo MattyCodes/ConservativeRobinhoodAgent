@@ -91,7 +91,7 @@ class Config
   def load_dotenv(path, env)
     return unless File.exist?(path)
 
-    File.foreach(path) do |line|
+    File.foreach(path, encoding: "bom|utf-8") do |line|
       line = line.strip
       next if line.empty? || line.start_with?("#")
 

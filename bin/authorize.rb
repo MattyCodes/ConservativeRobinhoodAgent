@@ -18,6 +18,9 @@ require "base64"
 require "socket"
 require "fileutils"
 
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+
 MCP_URL = ENV["ROBINHOOD_MCP_URL"] || "https://agent.robinhood.com/mcp/trading"
 TOKEN_PATH = File.expand_path("~/.config/conservative-robinhood-agent/token.json")
 REDIRECT_PORT = (ENV["OAUTH_CALLBACK_PORT"] || "8765").to_i

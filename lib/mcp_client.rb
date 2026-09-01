@@ -31,7 +31,7 @@ class McpClient
 
   RATE_LIMIT_RE = /rate.?limit|too many requests|\b429\b/i
   RETRY_BACKOFF = [2, 5, 12].freeze # seconds; also used for a 429 HTTP response
-  MIN_REQUEST_GAP = 0.15            # seconds between requests, to stay under the limit
+  MIN_REQUEST_GAP = 0.35            # seconds between requests, to stay under the limit
 
   # Calls an MCP tool and returns its structured result. Retries transparently on rate-limit
   # (both an isError tool result and an HTTP 429). Raises McpClient::Error for any other

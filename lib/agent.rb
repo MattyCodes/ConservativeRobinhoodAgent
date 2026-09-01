@@ -22,7 +22,8 @@ require_relative "approval"
 # Claude proposes; Guardrails is the authority; Broker is the only writer and is a no-op in
 # dry run. Every meaningful step is journaled and (in most cases) texted.
 class Agent
-  MAX_ANALYZE = 20 # cap technical lookups per run to bound API cost/time
+  MAX_ANALYZE = 30      # how many pre-ranked candidates get full technicals + go to Claude
+  PULLBACK_TARGET = 0.10 # rank names ~10% below their 52-wk high first (typical healthy pullback)
 
   # The list of human-readable things that happened this run (also the digest SMS body).
   # Readable by bin/watch.rb after #run, even if #run raised.
@@ -47,7 +48,7 @@ class Agent
     @summary = []
     @journal.record("scan_started", dry_run: @c.dry_run?, approval_mode: @c.approval_mode, fractional: fractional?)
 
-    @log.("account #{@broker.account_number}")
+    @broker.account_number # resolve + log (with type) once, up front
     manage_open_positions
     consider_new_entry
 
@@ -194,12 +195,15 @@ class Agent
       return
     end
 
-    proposal = @strategy.propose(candidates: candidates.map { |c| present(c) }, portfolio: portfolio)
-    unless proposal
-      @journal.record("no_trade", why: "strategy returned no_trade", considered: candidates.map { |c| c[:symbol] })
-      note("no trade this run (#{candidates.size} considered)")
+    outcome = @strategy.propose(candidates: candidates.map { |c| present(c) }, portfolio: portfolio)
+    unless outcome.enter?
+      miss = outcome.closest_miss.to_s.strip
+      @journal.record("no_trade", why: "strategy returned no_trade", closest_miss: miss,
+                                  confidence: outcome.confidence, considered: candidates.map { |c| c[:symbol] })
+      note("no trade (#{candidates.size} considered)#{" — closest: #{miss}" unless miss.empty?}")
       return
     end
+    proposal = outcome.proposal
 
     picked = candidates.find { |c| c[:symbol] == proposal.symbol }
     unless picked
@@ -306,7 +310,22 @@ class Agent
       excluded.include?(cand.symbol) || capped_sectors.include?(cand.sector)
     end
 
-    eligible.first(MAX_ANALYZE).map { |cand| attach_technicals(cand) }.compact
+    # Cheap pre-rank (uses fundamentals already fetched for the whole screen) so the expensive
+    # technical analysis and Claude see the names most likely to be in a pullback - not just the
+    # alphabetically-first ones. Both entry styles want a pullback; extended names and broken
+    # names both rank low. Down-trends among these are filtered later by the EMA-cross rule.
+    ranked = eligible.sort_by { |cand| pullback_rank(cand.fundamentals) }
+    @log.("analysing top #{[MAX_ANALYZE, ranked.size].min} of #{ranked.size} by pullback depth")
+    ranked.first(MAX_ANALYZE).map { |cand| attach_technicals(cand) }.compact
+  end
+
+  # Distance of the 52-week drawdown from PULLBACK_TARGET; lower = closer to a healthy pullback.
+  def pullback_rank(f)
+    hi = f[:week_52_high]
+    px = f[:price]
+    return 1.0 unless hi && px && hi.positive?
+
+    ((hi - px) / hi - PULLBACK_TARGET).abs
   end
 
   def attach_technicals(cand)
@@ -326,6 +345,7 @@ class Agent
         rsi: @md.rsi(cand.symbol, period: @c.s(:entry, :rsi_period)),
         week_52_high: cand.fundamentals[:week_52_high],
         week_52_low: cand.fundamentals[:week_52_low],
+        pct_below_52w_high: pct_below_high(cand.fundamentals[:week_52_high], price),
         nearest_earnings_days: earnings && (earnings - Date.today).to_i
       }
     }
@@ -336,6 +356,12 @@ class Agent
 
   def present(cand)
     cand.slice(:symbol, :name, :sector, :technicals)
+  end
+
+  def pct_below_high(hi, px)
+    return nil unless hi && px && hi.positive?
+
+    (((hi - px) / hi) * 100).round(1)
   end
 
   # --- journal-derived helpers ---------------------------------------

@@ -12,6 +12,11 @@ if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1")
   abort "Ruby >= 3.1 required (found #{RUBY_VERSION}). Install a current Ruby; the macOS system Ruby will not work."
 end
 
+# The Robinhood/Anthropic JSON and the constituents CSV are UTF-8; don't depend on the
+# ambient locale (cron/launchd/pipes often run with LANG unset => US-ASCII).
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+
 require_relative "lib/agent"
 
 ROOT = File.expand_path(__dir__)

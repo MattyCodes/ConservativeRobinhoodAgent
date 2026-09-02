@@ -14,7 +14,7 @@ universe:
   constituents_file: data/sp500.csv # symbol,name,sector — you maintain this
 
 sizing:
-  max_position_pct: 7.0             # of funded balance, per position
+  max_position_pct: 10.0           # of funded balance, per position
   max_risk_per_trade_pct: 2.0      # of funded balance (position_pct * stop_loss_pct)
   max_concurrent_positions: 10
   max_sector_pct: 25.0             # of funded balance in any one GICS sector

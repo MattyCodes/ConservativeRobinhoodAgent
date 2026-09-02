@@ -8,14 +8,18 @@ require "uri"
 # state, it asks Claude for AT MOST ONE entry that fits config/strategy.yml, or an explicit
 # "no_trade". Claude never sees money: it picks a symbol and explains why. All sizing, pricing,
 # and stop placement are computed deterministically downstream, then re-checked by guardrails.
+#
+# If a `transcript` Journal is passed, every call's full prompt + response + token usage is
+# written to it (log/claude_calls.jsonl) for later review of prompt/behaviour quality.
 class Strategy
   ENDPOINT = URI("https://api.anthropic.com/v1/messages")
 
   Proposal = Struct.new(:symbol, :rationale, :confidence, keyword_init: true)
 
-  # Always returned by #propose. On no_trade, `closest_miss` says how close the best candidate
-  # got - the instrument for judging whether the rules are too tight vs. the market just quiet.
-  Outcome = Struct.new(:action, :proposal, :closest_miss, :confidence, keyword_init: true) do
+  # Always returned by #propose. `closest_miss` (on no_trade) says how close the best candidate
+  # got; `usage`/`model`/`raw` carry the API accounting and Claude's exact tool input.
+  Outcome = Struct.new(:action, :proposal, :closest_miss, :confidence, :usage, :model, :raw,
+                       keyword_init: true) do
     def enter?
       action == "enter" && !proposal.nil?
     end
@@ -38,36 +42,47 @@ class Strategy
     }
   }.freeze
 
-  def initialize(config, logger: ->(_) {})
+  def initialize(config, logger: ->(_) {}, transcript: nil)
     @config = config
     @log = logger
+    @transcript = transcript
   end
 
-  # candidates: [{ symbol:, name:, sector:, technicals: {...} }]
-  # portfolio:  { settled_cash:, funded_balance:, open_positions: [...], sector_exposure: {...},
-  #               entries_today:, deployed_today:, cooldown_symbols: [...] }
+  # candidates: [{ symbol:, name:, sector:, rank_score:, technicals: {...} }]
+  # portfolio:  { settled_cash:, funded_balance:, ... }
   # Always returns an Outcome.
   def propose(candidates:, portfolio:)
-    return Outcome.new(action: "no_trade", proposal: nil, closest_miss: "", confidence: 1.0) if candidates.empty?
+    if candidates.empty?
+      return Outcome.new(action: "no_trade", proposal: nil, closest_miss: "", confidence: 1.0,
+                         usage: nil, model: nil, raw: nil)
+    end
 
+    system = system_prompt
+    user = user_prompt(candidates, portfolio)
     body = {
       model: @config.claude_model,
-      max_tokens: 1024,
+      max_tokens: 4096, # headroom - a truncated tool call silently drops closest_miss etc.
       tool_choice: { type: "tool", name: "propose_trade" },
       tools: [PROPOSE_TOOL],
-      system: system_prompt,
-      messages: [{ role: "user", content: user_prompt(candidates, portfolio) }]
+      system: system,
+      messages: [{ role: "user", content: user }]
     }
 
-    t = request(body)
+    t, usage, model = request(body)
     confidence = t["confidence"].to_f
-    @log.("strategy: #{t['action']} (confidence #{confidence})")
+    @log.("strategy: #{t['action']} (confidence #{confidence}) [in #{usage&.dig('input_tokens')} out #{usage&.dig('output_tokens')} tok]")
+
+    @transcript&.record("claude_call",
+                        model: model, usage: usage, response: t,
+                        system: system, user: user)
 
     if t["action"] == "enter" && !t["symbol"].to_s.empty?
       proposal = Proposal.new(symbol: t["symbol"].strip.upcase, rationale: t["rationale"].to_s, confidence: confidence)
-      Outcome.new(action: "enter", proposal: proposal, closest_miss: "", confidence: confidence)
+      Outcome.new(action: "enter", proposal: proposal, closest_miss: "", confidence: confidence,
+                  usage: usage, model: model, raw: t)
     else
-      Outcome.new(action: "no_trade", proposal: nil, closest_miss: t["closest_miss"].to_s, confidence: confidence)
+      Outcome.new(action: "no_trade", proposal: nil, closest_miss: t["closest_miss"].to_s, confidence: confidence,
+                  usage: usage, model: model, raw: t)
     end
   end
 
@@ -107,6 +122,7 @@ class Strategy
     TXT
   end
 
+  # Returns [tool_input_hash, usage_hash, model_string].
   def request(body)
     req = Net::HTTP::Post.new(ENDPOINT)
     req["x-api-key"] = @config.anthropic_api_key
@@ -124,6 +140,6 @@ class Strategy
     block = Array(payload["content"]).find { |c| c["type"] == "tool_use" && c["name"] == "propose_trade" }
     raise "no propose_trade tool_use in response: #{res.body}" unless block
 
-    block.fetch("input")
+    [block.fetch("input"), payload["usage"], payload["model"]]
   end
 end

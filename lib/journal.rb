@@ -17,25 +17,21 @@ class Journal
     FileUtils.mkdir_p(File.dirname(path))
   end
 
+  # Returns the recorded row as it would be read back: string keys (via a JSON round-trip),
+  # so callers and the in-memory cache see the same shape #events produces.
   def record(event, **fields)
-    row = { at: Time.now.utc.iso8601, event: event.to_s }.merge(fields)
-    File.open(@path, "a:utf-8") { |f| f.puts(JSON.generate(row)) }
+    json = JSON.generate({ at: Time.now.utc.iso8601, event: event.to_s }.merge(fields))
+    File.open(@path, "a:utf-8") { |f| f.puts(json) }
+    row = JSON.parse(json)
+    @cache << row if @cache
     row
   end
 
+  # Parsed once per process, then kept in sync by #record. The file only grows during a run
+  # and only through this object, so an in-memory append is safe and avoids re-parsing a
+  # multi-MB file on every pacing/cooldown query.
   def events
-    return [] unless File.exist?(@path)
-
-    File.foreach(@path, encoding: "bom|utf-8").map do |line|
-      line = line.strip
-      next if line.empty?
-
-      begin
-        JSON.parse(line)
-      rescue JSON::ParserError
-        nil
-      end
-    end.compact
+    @cache ||= load_events
   end
 
   # Number of new entries placed on `date` (local date).
@@ -64,6 +60,21 @@ class Journal
   end
 
   private
+
+  def load_events
+    return [] unless File.exist?(@path)
+
+    File.foreach(@path, encoding: "bom|utf-8").map do |line|
+      line = line.strip
+      next if line.empty?
+
+      begin
+        JSON.parse(line)
+      rescue JSON::ParserError
+        nil
+      end
+    end.compact
+  end
 
   def entries_for(date)
     target = date.is_a?(String) ? date : date.iso8601

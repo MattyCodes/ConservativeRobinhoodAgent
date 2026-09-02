@@ -1,6 +1,6 @@
 # ConservativeRobinhoodAgent
 
-Personal project. A local Ruby service that, once per weekday, screens the S&P 500, asks Claude
+Personal project. A local Ruby service that, on a weekday schedule, screens the S&P 500, asks Claude
 for one conservative entry that fits `config/strategy.yml`, re-checks it against hard-coded
 guardrails, and — if it passes — places it in a dedicated **Robinhood Agentic** account. Runs in
 a terminal window you keep open (`ruby bin/watch.rb`).
@@ -30,21 +30,35 @@ next pass. Set `false` for whole-share limit entries + native GTC stops (needs 7
 ```
 ruby bin/authorize.rb     # one-time Robinhood OAuth (writes ~/.config/conservative-robinhood-agent/token.json)
 ruby main.rb              # one pass, then exit — for dry-run checks
-ruby bin/watch.rb         # foreground supervisor: pass on startup + one per weekday at RUN_AT (default 10:30 local)
+ruby bin/watch.rb         # foreground supervisor (the normal way to run it)
 ```
 
-`bin/watch.rb` prints every pass and a heartbeat; Ctrl-C stops it. Config comes from `.env`
-(copy `.env.example`). `data/sp500.csv` is the universe — you maintain it. Requires Ruby ≥ 3.1.
+`bin/watch.rb` runs a **full pass** (screen + Claude + position management) at each `RUN_AT`
+time on weekdays, plus a lightweight **stop-check** (position management only, no Claude —
+just the deterministic guardrails) every `STOP_CHECK_MINUTES` while the market is open. It
+prints every pass and a heartbeat; Ctrl-C stops it; a `HALT` file pauses everything. Config
+comes from `.env` (copy `.env.example`). `data/sp500.csv` is the universe — you maintain it.
+Requires Ruby ≥ 3.1.
 
 ## Layout
 
-- `lib/agent.rb` — orchestrates one pass (manage positions → maybe one new entry)
+- `lib/agent.rb` — orchestrates a pass; `run(scan_for_entry: false)` = stop-check only, no Claude
 - `lib/guardrails.rb` — re-derives whether/how big an order is allowed; the real safety layer
 - `lib/strategy.rb` — builds the prompt, calls Claude, parses one proposal
-- `lib/broker.rb` — the only writer; no-op unless `DRYRUN=false`
-- `lib/mcp_client.rb` — MCP client + OAuth refresh + rate-limit backoff
+- `lib/broker.rb` — the only writer; live orders, or routed to the paper ledger in dry-run
+- `lib/paper.rb` — dry-run paper portfolio so the full lifecycle (limits, cool-downs, stops, P&L) is simulated
+- `lib/mcp_client.rb` — MCP client + OAuth refresh + rate-limit backoff + call counters
 - `lib/market_data.rb` · `lib/universe.rb` — read-only Robinhood data + the eligibility screen
 - `lib/{journal,notifier,approval,config}.rb` — JSONL log, SMS, approval loop, config+validation
+
+## Logs (`log/`, all gitignored)
+
+- `journal.jsonl` — every decision + `scan_started` (effective config, git rev) + `scan_finished`
+  (duration, MCP call/retry counts, outcome) + `candidates` (the ranked pool with technicals,
+  what just missed the cut, what got dropped)
+- `claude_calls.jsonl` — every Claude call: full prompt, full response, token usage
+- `paper.jsonl` — dry-run paper positions: `paper_opened` / `paper_closed` with entry/exit/P&L
+- `run.log` — the human-readable narrative (dated)
 
 ## Disclaimer
 

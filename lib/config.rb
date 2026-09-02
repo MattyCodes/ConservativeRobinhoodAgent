@@ -45,6 +45,13 @@ class Config
     ((@env["APPROVAL_TIMEOUT_MINUTES"] || "15").to_i) * 60
   end
 
+  # Paper-portfolio starting balance (dry-run only). Bigger = position sizing isn't the
+  # bottleneck, so the simulation actually exercises the strategy. Default $1,000.
+  def paper_start_usd
+    v = @env["PAPER_START_USD"].to_s.strip
+    v.empty? ? 1000.0 : v.to_f
+  end
+
   # --- credentials / endpoints ------------------------------------------------
 
   def anthropic_api_key

@@ -12,6 +12,7 @@ require_relative "universe"
 require_relative "strategy"
 require_relative "guardrails"
 require_relative "broker"
+require_relative "paper"
 require_relative "notifier"
 require_relative "approval"
 
@@ -29,6 +30,18 @@ class Agent
   # Readable by bin/watch.rb after #run, even if #run raised.
   attr_reader :summary
 
+  # Short git SHA (with -dirty suffix if the tree has uncommitted changes), or nil. Cached.
+  def self.git_rev
+    return @git_rev if defined?(@git_rev)
+
+    Dir.chdir(Config::ROOT) do
+      sha = `git rev-parse --short HEAD 2>/dev/null`.strip
+      @git_rev = sha.empty? ? nil : (sha + (`git status --porcelain 2>/dev/null`.strip.empty? ? "" : "-dirty"))
+    end
+  rescue StandardError
+    @git_rev = nil
+  end
+
   def initialize(config)
     @c = config
     @journal = Journal.new(File.join(Config::ROOT, "log", "journal.jsonl"))
@@ -36,33 +49,64 @@ class Agent
 
     @mcp = McpClient.new(url: @c.mcp_url, logger: @log)
     @md = MarketData.new(@mcp)
-    @broker = Broker.new(@c, @mcp, logger: @log)
+
+    # DRY-RUN: a paper portfolio stands in for the broker so the strategy's full lifecycle
+    # (concurrent limits, sector caps, cool-downs, trailing stops, time exits, P&L) is exercised.
+    @paper =
+      if @c.dry_run?
+        PaperLedger.new(Journal.new(File.join(Config::ROOT, "log", "paper.jsonl")),
+                        start_usd: @c.paper_start_usd,
+                        quote_fn: ->(sym) { @md.quote(sym)[:price] })
+      end
+
+    @transcript = Journal.new(File.join(Config::ROOT, "log", "claude_calls.jsonl"))
+
+    @broker = Broker.new(@c, @mcp, logger: @log, paper: @paper)
     @universe = Universe.new(@c, @md, @journal, logger: @log)
-    @strategy = Strategy.new(@c, logger: @log)
+    @strategy = Strategy.new(@c, logger: @log, transcript: @transcript)
     @guardrails = Guardrails.new(@c)
     @notifier = Notifier.new(@c, logger: @log)
     @approval = Approval.new(@c, logger: @log)
   end
 
-  def run
+  # scan_for_entry: false runs a lightweight position-management-only pass - stop checks,
+  # trailing-stop ratchets, the 30-day time exit - with NO universe screen and NO Claude call.
+  # It stays silent (no digest SMS) unless it actually closed a position or errored.
+  def run(scan_for_entry: true)
     @summary = []
-    @journal.record("scan_started", dry_run: @c.dry_run?, approval_mode: @c.approval_mode, fractional: fractional?)
+    @scan_for_entry = scan_for_entry
+    @started_at = Time.now
+    @outcome = scan_for_entry ? "no_trade" : "stop_check"
+    @run_meta = {}
+    kind = scan_for_entry ? "full" : "stop_check"
+
+    @journal.record("scan_started", kind: kind, dry_run: @c.dry_run?, approval_mode: @c.approval_mode,
+                                    fractional: fractional?, paper: !@paper.nil?,
+                                    code_rev: self.class.git_rev, ruby: RUBY_VERSION,
+                                    tuning: { max_analyze: MAX_ANALYZE, pullback_target: PULLBACK_TARGET,
+                                              paper_start_usd: (@c.paper_start_usd if @paper) },
+                                    strategy: @c.strategy)
 
     @broker.account_number # resolve + log (with type) once, up front
     manage_open_positions
-    consider_new_entry
+    consider_new_entry if scan_for_entry
 
-    @journal.record("scan_finished")
+    @outcome = "error" if @summary.any? { |l| l.start_with?("ERROR") }
   rescue StandardError => e
-    @journal.record("error", klass: e.class.to_s, message: e.message, backtrace: e.backtrace&.first(5))
+    @outcome = "error"
+    @journal.record("error", kind: kind, klass: e.class.to_s, message: e.message, backtrace: e.backtrace&.first(5))
     (@summary ||= []) << "ERROR: #{e.class}: #{e.message}"
     raise
   ensure
+    @journal.record("scan_finished", kind: kind, outcome: @outcome,
+                                     duration_s: (Time.now - @started_at).round(2),
+                                     mcp_calls: @mcp.call_count, rate_limit_retries: @mcp.rate_limit_hits,
+                                     **(@run_meta || {}))
     send_digest
   end
 
-  # One SMS per run (the chosen cadence is once daily) summarising everything that happened.
-  # Immediate SMS is reserved for the approval request (confirm mode), sent from Approval.
+  # One SMS per full pass summarising everything that happened; a stop-check pass sends only
+  # when it acted. Immediate SMS is otherwise reserved for the approval request (confirm mode).
   def note(text)
     @log.(text)
     (@summary ||= []) << text
@@ -70,6 +114,11 @@ class Agent
 
   def send_digest
     lines = @summary || []
+    if @scan_for_entry == false
+      @log.("stop-check: nothing to do") if lines.empty?
+      notify("stop-check:\n- #{lines.join("\n- ")}") unless lines.empty?
+      return
+    end
     body = lines.empty? ? "run complete — no positions changed, no new entry" : "run complete:\n- #{lines.join("\n- ")}"
     notify(body)
   end
@@ -96,7 +145,9 @@ class Agent
 
       next if handle_time_exit(symbol, qty, opened)
 
-      if fractional?
+      # Fractional entries can't carry a native stop; dry-run/paper has no broker to hold one
+      # either. Both cases enforce the stop actively here. Live whole-share uses a real GTC stop.
+      if fractional? || @c.dry_run?
         enforce_script_stop(symbol, qty, entry, price)
       else
         ensure_and_ratchet_stop(symbol, qty, entry, price)
@@ -112,7 +163,8 @@ class Agent
 
     @log.("time exit #{symbol} (age #{age}d)")
     cancel_sell_orders(symbol)
-    result = @broker.close_position(symbol, qty)
+    result = @broker.close_position(symbol, qty, reason: "time_exit")
+    @outcome = "closed"
     @journal.record("position_closed", symbol: symbol, reason: "time_exit", age_days: age, result: result)
     note("time exit: sell #{qfmt(qty)} #{symbol} (held #{age}d)#{' [dry]' if @c.dry_run?}")
     true
@@ -154,8 +206,9 @@ class Agent
 
     if price <= level
       cancel_sell_orders(symbol)
-      result = @broker.close_position(symbol, qty)
       reason = price <= hard ? "stop_loss" : "trailing_stop"
+      result = @broker.close_position(symbol, qty, reason: reason)
+      @outcome = "closed"
       @journal.record("position_closed", symbol: symbol, reason: reason, price: price,
                                          stop_level: level, result: result)
       note("SCRIPT STOP #{symbol}: #{fmt(price)} <= #{fmt(level)} (#{reason}) - closing #{qfmt(qty)}#{' [dry]' if @c.dry_run?}")
@@ -188,7 +241,13 @@ class Agent
       return
     end
 
-    candidates = screened_candidates(portfolio)
+    candidates, meta = screened_candidates(portfolio)
+    @run_meta = { eligible_count: meta[:eligible_count], candidates_analyzed: candidates.size,
+                  candidates_dropped: meta[:dropped].size }
+    @journal.record("candidates", eligible_count: meta[:eligible_count],
+                                  dropped: meta[:dropped], ranked_tail: meta[:ranked_tail],
+                                  analyzed: candidates)
+
     if candidates.empty?
       @journal.record("no_trade", why: "no candidates after screen/exclusions")
       note("no eligible candidates this run")
@@ -196,8 +255,15 @@ class Agent
     end
 
     outcome = @strategy.propose(candidates: candidates.map { |c| present(c) }, portfolio: portfolio)
+    @run_meta[:claude_usage] = outcome.usage
+    @run_meta[:claude_model] = outcome.model
+    @journal.record("claude_call", action: outcome.action, confidence: outcome.confidence,
+                                   symbol: outcome.proposal&.symbol, closest_miss: outcome.closest_miss,
+                                   usage: outcome.usage, model: outcome.model, raw: outcome.raw)
+
     unless outcome.enter?
       miss = outcome.closest_miss.to_s.strip
+      @outcome = "no_trade"
       @journal.record("no_trade", why: "strategy returned no_trade", closest_miss: miss,
                                   confidence: outcome.confidence, considered: candidates.map { |c| c[:symbol] })
       note("no trade (#{candidates.size} considered)#{" — closest: #{miss}" unless miss.empty?}")
@@ -219,23 +285,26 @@ class Agent
     )
 
     unless decision.ok?
+      @outcome = "blocked"
       @journal.record("guardrail_block", symbol: proposal.symbol, violations: decision.violations,
                                           rationale: proposal.rationale)
       note("blocked #{proposal.symbol}: #{decision.violations.join('; ')}")
       return
     end
 
-    execute(decision.order, proposal)
+    execute(decision.order, proposal, picked)
   end
 
-  def execute(order, proposal)
+  def execute(order, proposal, picked = nil)
     review = safe_review(order)
     summary = order_summary(order, proposal, review)
     @journal.record("proposal_passed", order: order.to_h, rationale: proposal.rationale,
-                                       confidence: proposal.confidence, review: review)
+                                       confidence: proposal.confidence,
+                                       technicals: picked && picked[:technicals], review: review)
 
     if @c.approval_mode == "confirm"
       unless @approval.request_and_wait(summary, timeout_seconds: @c.approval_timeout_seconds)
+        @outcome = "approval_denied"
         @journal.record("approval_denied", symbol: order.symbol)
         note("not approved in time — #{order.symbol} skipped")
         return
@@ -244,19 +313,22 @@ class Agent
       note("AUTO-PLACING (notify mode):\n#{summary}")
     end
 
-    entry_result = @broker.place_entry(order)
+    # Reference entry price for later stop math (and the paper fill): the freshest quote,
+    # falling back to the limit price or notional/qty.
+    entry_price = @md.quote(order.symbol)[:price] || order.limit_price ||
+                  (order.quantity.to_f.positive? ? (order.notional / order.quantity).round(2) : nil)
 
-    # Whole-share entries get a native stop right away; fractional entries can't, so the stop
-    # is tracked script-side starting on the next run (once the fill price is known).
+    entry_result = @broker.place_entry(order, entry_ref_price: entry_price)
+    @outcome = "entry"
+
+    # Whole-share LIVE entries get a native stop right away; every other path (fractional, or
+    # any dry-run/paper) is tracked script-side from the next run.
     stop_result =
-      if order.order_type == "market"
+      if order.order_type == "market" || @c.dry_run?
         { script_monitored: true, level: order.stop_price }
       else
         @broker.place_stop(symbol: order.symbol, quantity: order.quantity, stop_price: order.stop_price)
       end
-
-    # Reference entry price for later stop math if Robinhood doesn't report average_buy_price.
-    entry_price = order.limit_price || (order.quantity.to_f.positive? ? (order.notional / order.quantity).round(2) : nil)
 
     @journal.record("order_placed", role: "entry", symbol: order.symbol, order_type: order.order_type,
                                     quantity: order.quantity, dollar_amount: order.dollar_amount,
@@ -300,6 +372,8 @@ class Agent
     }
   end
 
+  # Returns [analyzed, meta] where analyzed is the top-N ranked candidates with full technicals
+  # (fetch-failures removed) and meta = { eligible_count:, dropped: [syms], ranked_tail: [...] }.
   def screened_candidates(portfolio)
     excluded = (portfolio[:open_symbols] + portfolio[:cooldown_symbols]).to_set
     full = @c.s(:sizing, :max_sector_pct)
@@ -316,7 +390,25 @@ class Agent
     # names both rank low. Down-trends among these are filtered later by the EMA-cross rule.
     ranked = eligible.sort_by { |cand| pullback_rank(cand.fundamentals) }
     @log.("analysing top #{[MAX_ANALYZE, ranked.size].min} of #{ranked.size} by pullback depth")
-    ranked.first(MAX_ANALYZE).map { |cand| attach_technicals(cand) }.compact
+
+    dropped = []
+    analyzed = ranked.first(MAX_ANALYZE).map do |cand|
+      row = attach_technicals(cand)
+      if row.nil?
+        dropped << cand.symbol
+        next
+      end
+      row.merge(rank_score: pullback_rank(cand.fundamentals).round(4))
+    end.compact
+
+    # The next slice past the cut, cheap fields only (no API calls) - shows what just missed.
+    tail = ranked[MAX_ANALYZE, 15].to_a.map do |cand|
+      { symbol: cand.symbol, sector: cand.sector,
+        rank_score: pullback_rank(cand.fundamentals).round(4),
+        pct_below_52w_high: pct_below_high(cand.fundamentals[:week_52_high], cand.fundamentals[:price]) }
+    end
+
+    [analyzed, { eligible_count: eligible.size, dropped: dropped, ranked_tail: tail }]
   end
 
   # Distance of the 52-week drawdown from PULLBACK_TARGET; lower = closer to a healthy pullback.
@@ -349,13 +441,13 @@ class Agent
         nearest_earnings_days: earnings && (earnings - Date.today).to_i
       }
     }
-  rescue McpClient::Error => e
-    @log.("technicals #{cand.symbol} failed: #{e.message}")
+  rescue StandardError => e
+    @log.("technicals #{cand.symbol} failed: #{e.class}: #{e.message}")
     nil
   end
 
   def present(cand)
-    cand.slice(:symbol, :name, :sector, :technicals)
+    cand.slice(:symbol, :name, :sector, :rank_score, :technicals)
   end
 
   def pct_below_high(hi, px)
@@ -443,7 +535,7 @@ class Agent
   end
 
   def log(msg)
-    line = "#{Time.now.strftime('%H:%M:%S')} #{msg}"
+    line = "#{Time.now.strftime('%Y-%m-%d %H:%M:%S')} #{msg}"
     puts line
     File.open(File.join(Config::ROOT, "log", "run.log"), "a") { |f| f.puts(line) }
   end

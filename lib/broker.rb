@@ -2,19 +2,23 @@
 
 require "securerandom"
 
-# The only component that touches Robinhood's write tools. Every mutating method is a no-op that
-# returns a :dry_run result unless config.dry_run? is false. review_equity_order is non-mutating
-# and always runs, so a dry run still surfaces real buying-power / halt alerts.
-#
-# Entries are marketable limit orders (regular hours, good-for-day). Every entry is paired with a
-# native stop_market (GTC) so downside protection survives this process being offline.
+# The only component that touches Robinhood's write tools. In LIVE mode it places real orders.
+# In DRY-RUN mode, if a PaperLedger was supplied, position/portfolio reads and would-be fills
+# are routed to the paper portfolio (so the strategy's full lifecycle is simulated); without
+# one, mutating calls are logged no-ops. review_equity_order is non-mutating and always hits
+# the real API, so a dry run still surfaces real quotes / buying-power / halt alerts.
 class Broker
   class NotAgentic < StandardError; end
 
-  def initialize(config, mcp_client, logger: ->(_) {})
+  def initialize(config, mcp_client, logger: ->(_) {}, paper: nil)
     @c = config
     @mcp = mcp_client
     @log = logger
+    @paper = paper
+  end
+
+  def paper?
+    @c.dry_run? && !@paper.nil?
   end
 
   # Resolves and caches the single agentic-tradable account, verifying it is a cash account.
@@ -27,11 +31,15 @@ class Broker
   end
 
   def positions
+    return @paper.positions if paper?
+
     list(@mcp.call("get_equity_positions", { account_number: account_number }))
       .reject { |p| p["quantity"].to_f.zero? }
   end
 
   def open_orders(symbol = nil)
+    return [] if paper? # the paper ledger has no resting orders; stops are script-enforced
+
     rows = list(@mcp.call("get_equity_orders", { account_number: account_number }))
     rows = rows.select { |o| %w[queued confirmed partially_filled unconfirmed].include?(o["state"]) }
     symbol ? rows.select { |o| o["symbol"] == symbol } : rows
@@ -46,6 +54,8 @@ class Broker
   # "never use margin" (see strategy.yml exit/pacing caps, which are always checked against
   # this number, never against a margin-inclusive buying power).
   def portfolio
+    return @paper.portfolio if paper?
+
     p = data(@mcp.call("get_portfolio", { account_number: account_number }))
     bp = p["buying_power"].is_a?(Hash) ? p["buying_power"] : {}
     {
@@ -60,7 +70,17 @@ class Broker
     @mcp.call("review_equity_order", entry_params(order))
   end
 
-  def place_entry(order)
+  # entry_ref_price: the price to record as the paper fill (from Guardrails - the quote used to
+  # size the order). Ignored in live mode.
+  def place_entry(order, entry_ref_price: nil)
+    if paper?
+      px = entry_ref_price || order.limit_price
+      @paper.open(symbol: order.symbol, entry_price: px, dollar_amount: order.notional,
+                  quantity: order.quantity, stop_price: order.stop_price,
+                  sector: order.sector, order_type: order.order_type)
+      @log.("PAPER entry #{order.symbol} #{order.order_type} ~$#{order.notional} @#{px}")
+      return { paper: true, entry_price: px }
+    end
     return dry(:entry, entry_params(order)) if @c.dry_run?
 
     ref = SecureRandom.uuid
@@ -74,6 +94,7 @@ class Broker
   # fractional quantities - so in fractional mode this is a deliberate no-op and the stop is
   # enforced script-side by Agent (see strategy.yml sizing.fractional_shares).
   def place_stop(symbol:, quantity:, stop_price:)
+    return { skipped: "paper mode - stop is script-monitored" } if paper?
     return { skipped: "fractional mode - stop is script-monitored" } if fractional?
 
     params = {
@@ -99,9 +120,16 @@ class Broker
     @mcp.call("cancel_equity_order", { account_number: account_number, order_id: order_id })
   end
 
-  # Full-position market sell (regular hours). Used for the time-based exit and, in fractional
-  # mode, for the script-monitored stop. quantity may be fractional (up to 6 dp).
-  def close_position(symbol, quantity)
+  # Full-position market sell (regular hours). Used for the time-based exit and the
+  # script-monitored stop. quantity may be fractional (up to 6 dp). `reason` is recorded by the
+  # paper ledger and ignored live.
+  def close_position(symbol, quantity, reason: "manual")
+    if paper?
+      ev = @paper.close(symbol: symbol, reason: reason)
+      @log.("PAPER close #{symbol} (#{reason}) pnl #{ev && ev['pnl_pct']}%")
+      return { paper: true, close: ev }
+    end
+
     params = {
       account_number: account_number, symbol: symbol, side: "sell",
       type: "market", quantity: qty_str(quantity),

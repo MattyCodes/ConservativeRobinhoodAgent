@@ -20,6 +20,9 @@ class McpClient
   PROTOCOL_VERSION = "2025-06-18"
   TOKEN_PATH = File.expand_path("~/.config/conservative-robinhood-agent/token.json")
 
+  # Per-process counters for the run metrics (Agent reads them at scan_finished).
+  attr_reader :call_count, :rate_limit_hits
+
   def initialize(url:, token_path: TOKEN_PATH, logger: nil)
     @uri = URI(url)
     @token_path = token_path
@@ -27,6 +30,8 @@ class McpClient
     @id = 0
     @session_id = nil
     @initialized = false
+    @call_count = 0
+    @rate_limit_hits = 0
   end
 
   RATE_LIMIT_RE = /rate.?limit|too many requests|\b429\b/i
@@ -38,6 +43,7 @@ class McpClient
   # tool-level error so callers can treat a normal return as success.
   def call(tool_name, arguments = {})
     ensure_initialized
+    @call_count += 1
 
     attempt = 0
     begin
@@ -53,6 +59,7 @@ class McpClient
 
       result.key?("structuredContent") ? result["structuredContent"] : parse_content(content)
     rescue RateLimited => e
+      @rate_limit_hits += 1
       wait = RETRY_BACKOFF[attempt]
       raise Error, "MCP tool #{tool_name} rate-limited after #{RETRY_BACKOFF.size} retries" unless wait
 

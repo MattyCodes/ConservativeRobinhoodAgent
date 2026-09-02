@@ -158,10 +158,12 @@ loop do
     else
       run_pass(config, scan_for_entry: true, label: "full pass (#{pending_first ? 'startup' : 'scheduled'})")
     end
-    last_full_run_at = now
-    last_stop_check_at = now # a full pass already managed positions
+    # Re-read the clock: run_pass can take a minute+, so `now` (captured at loop top) is stale.
+    done = Time.now
+    last_full_run_at = done
+    last_stop_check_at = done # a full pass already managed positions
     pending_first = false
-    last_heartbeat = now
+    last_heartbeat = done
     say "next full pass: #{next_slot_time(SLOTS).strftime('%a %Y-%m-%d %H:%M')}"
   elsif stop_due
     if halted
@@ -169,10 +171,18 @@ loop do
     else
       run_pass(config, scan_for_entry: false, label: "stop-check")
     end
-    last_stop_check_at = now
+    last_stop_check_at = Time.now
+    last_heartbeat = Time.now
   elsif Time.now - last_heartbeat >= HEARTBEAT_SECONDS
     nxt = next_slot_time(SLOTS)
-    extra = STOP_CHECK_SECONDS.positive? ? ", stop-check ~#{humanize(STOP_CHECK_SECONDS - (Time.now - last_stop_check_at))}" : ""
+    extra =
+      if !STOP_CHECK_SECONDS.positive?
+        ""
+      elsif in_window?(Time.now, MARKET_WINDOW)
+        ", stop-check ~#{humanize(STOP_CHECK_SECONDS - (Time.now - last_stop_check_at))}"
+      else
+        ", stop-check idle until #{fmt_window(MARKET_WINDOW).split('-').first}"
+      end
     say "waiting - next full pass #{nxt.strftime('%a %H:%M')} (in #{humanize(nxt - Time.now)})#{extra}#{' [HALT set]' if halted}"
     last_heartbeat = Time.now
   end

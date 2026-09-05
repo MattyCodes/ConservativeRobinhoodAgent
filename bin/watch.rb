@@ -108,6 +108,27 @@ def say(msg)
   $stdout.flush
 end
 
+# Single-instance guard: a stray second watcher doubles the API load and corrupts the logs
+# (concurrent passes). Refuse to start if another live watcher holds the pid file.
+def claim_singleton!(pid_file)
+  if File.exist?(pid_file)
+    other = File.read(pid_file).to_i
+    if other.positive? && other != Process.pid
+      begin
+        Process.kill(0, other)
+        running = `ps -p #{other} -o command= 2>/dev/null`.include?("watch.rb")
+      rescue Errno::ESRCH
+        running = false
+      rescue Errno::EPERM
+        running = true
+      end
+      abort "another watcher is already running (PID #{other}). Stop it (pkill -f bin/watch.rb) or rm #{pid_file}" if running
+    end
+  end
+  File.write(pid_file, Process.pid.to_s)
+  at_exit { File.delete(pid_file) if File.exist?(pid_file) && File.read(pid_file).to_i == Process.pid }
+end
+
 def run_pass(config, scan_for_entry:, label:)
   say "---- #{label} start ----"
   agent = Agent.new(config)
@@ -130,6 +151,8 @@ config = Config.new
 SLOTS = parse_slots(ENV["RUN_AT"])
 STOP_CHECK_SECONDS = (ENV["STOP_CHECK_MINUTES"].to_s.strip.empty? ? 60 : ENV["STOP_CHECK_MINUTES"].to_i) * 60
 MARKET_WINDOW = parse_window(ENV["MARKET_HOURS"])
+
+claim_singleton!(File.join(Config::ROOT, "log", "watch.pid"))
 
 trap("INT")  { puts; say "stopping (Ctrl-C)."; exit 0 }
 trap("TERM") { exit 0 }

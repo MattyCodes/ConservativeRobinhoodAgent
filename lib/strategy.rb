@@ -90,14 +90,36 @@ class Strategy
 
   def system_prompt
     <<~TXT
-      You select conservative, large-cap equity entries for an automated account. You must obey
-      the strategy rules below exactly. Prefer no_trade over a marginal setup - most runs should
-      return no_trade. Never propose a symbol that is not in the provided candidate list. Never
-      propose a symbol already held, in cool-down, or whose sector is already at its cap. You are
-      choosing a name and justifying it against a specific entry rule; position size, price, and
-      stops are handled by the system, not by you.
+      You pick conservative large-cap equity entries for an automated account, applying the two
+      entry rules below MECHANICALLY.
 
-      STRATEGY RULES (config/strategy.yml):
+      Both rules require the 50-day EMA to be above the 200-day EMA (an established uptrend).
+
+        TREND-PULLBACK: price is above the 200-EMA, AND price is between the 50-EMA and
+        trend_pullback_band_pct above it - i.e. price >= 50-EMA and
+        price <= 50-EMA * (1 + trend_pullback_band_pct/100).
+
+        MEAN-REVERSION: RSI <= rsi_entry_max, AND price is between meanrev_support_band_pct
+        below the 200-EMA and twice that above it - i.e.
+        price >= 200-EMA * (1 - meanrev_support_band_pct/100) and
+        price <= 200-EMA * (1 + 2 * meanrev_support_band_pct/100).
+
+      If a candidate satisfies EITHER rule exactly as written, return action=enter and cite the
+      numbers. Do NOT impose conditions that are not in these rules: there is no "slope must be
+      clearly rising", no "trend must be strongly confirmed", no "only marginally inside the
+      band, so hold back". Inside the band is inside the band; RSI 39.9 <= 40 qualifies. Name
+      which of the two rules you used, correctly.
+
+      Return action=no_trade ONLY when no candidate satisfies either rule. Do not treat no_trade
+      as a stylistic default.
+
+      A downstream guardrail layer independently re-checks position sizing, the concurrent /
+      sector / daily caps, cool-downs, and the earnings blackout, and is the final authority -
+      you never need to be more conservative than the two rules above. Never propose a symbol
+      that is not in the candidate list, is already held, is in cool-down, or whose sector is
+      flagged at its cap. Position size, price, and stop placement are set by the system.
+
+      STRATEGY PARAMETERS (config/strategy.yml):
       #{JSON.pretty_generate(@config.strategy)}
     TXT
   end
@@ -116,9 +138,8 @@ class Strategy
       must name the specific rule met (e.g. "mean-reversion: RSI 34 < 40 and price within 1% of
       rising 200-EMA") and cite the numbers.
 
-      For a no_trade, still fill in closest_miss: pick the ONE candidate that was nearest to
-      qualifying and state exactly what it missed by (which rule, current value vs threshold).
-      This is used to tell whether the rules are too tight or the market is just quiet.
+      For a no_trade, fill in closest_miss: the ONE candidate nearest to satisfying a rule and
+      the exact gap - which rule, current value vs threshold (e.g. "FE: RSI 41.3, needs <=40").
     TXT
   end
 

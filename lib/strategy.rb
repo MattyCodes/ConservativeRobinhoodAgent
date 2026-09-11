@@ -25,20 +25,33 @@ class Strategy
     end
   end
 
+  # Field order matters: Claude fills a tool call's fields in the order they're declared here,
+  # and with tool_choice forcing this tool there is no extended-thinking scratchpad separate
+  # from it - these fields ARE the only place it can reason. `analysis` is declared first so the
+  # verdict (`action`/`symbol`) is written AFTER the reasoning, not before it. (Observed live:
+  # with action/symbol declared first, Claude would commit to e.g. "enter TROW" and only then,
+  # in `rationale`, work out that TROW fails and a different symbol qualifies - too late to
+  # change what it already submitted. That failure mode showed up in ~40% of no_trade calls.)
   PROPOSE_TOOL = {
     name: "propose_trade",
     description: "Return exactly one conservative entry that satisfies every rule, or no_trade.",
+    strict: true, # guarantees tool_use.input actually validates against the schema below -
+                  # without it, a long `analysis` was observed to drift out of JSON structure
+                  # near the end and leave `action` empty instead of a real enter/no_trade.
     input_schema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        action: { type: "string", enum: %w[enter no_trade] },
-        symbol: { type: "string", description: "Ticker to buy; required when action=enter." },
-        rationale: { type: "string", description: "action=enter: which entry rule is met, with the numbers. action=no_trade: why nothing qualified." },
-        closest_miss: { type: "string", description: "action=no_trade only: the single candidate that came closest to qualifying and exactly what it missed by, e.g. 'MSFT: RSI 46, needs <=40; otherwise a clean trend pullback'. Empty string if nothing was remotely close." },
-        confidence: { type: "number", minimum: 0, maximum: 1, description: "Confidence in THIS decision (the enter, or the no_trade) - NOT a probability that trading is a good idea." }
+        analysis: { type: "string", description: "REQUIRED FIRST. Before deciding anything: check the 3-5 candidates with the best rank_score against both entry rules, explicitly, with their exact numbers, one by one. State pass/fail for each against each rule. Do this completely before writing anything below - action and symbol must be the conclusion of this analysis, never a preliminary guess you reasoned your way out of. Plain prose only: end it once your conclusion is reached, do not restate action/symbol/rationale/confidence as tags or any other markup inside this string - they belong only in their own fields below." },
+        action: { type: "string", enum: %w[enter no_trade], description: "Must match the conclusion of `analysis` exactly. If `analysis` found a qualifying candidate, this is enter with that symbol - never no_trade." },
+        symbol: { type: "string", description: "Ticker to buy; required when action=enter. Must be the candidate `analysis` concluded qualifies." },
+        rationale: { type: "string", description: "Concise restatement of the analysis conclusion: which rule is met (enter) or why nothing qualified (no_trade), with the numbers." },
+        closest_miss: { type: "string", description: "action=no_trade only: the single candidate that came closest to qualifying and exactly what it missed by, e.g. 'MSFT: RSI 46, needs <=40; otherwise a clean trend pullback'. Empty string if nothing was remotely close. Must be consistent with `analysis` - if analysis found a qualifier, closest_miss is moot because action should be enter, not no_trade." },
+        # strict mode's schema subset doesn't support minimum/maximum on numbers - clamped in
+        # code instead (see #propose).
+        confidence: { type: "number", description: "Confidence in THIS decision (the enter, or the no_trade), from 0.0 to 1.0 - NOT a probability that trading is a good idea." }
       },
-      required: %w[action rationale confidence]
+      required: %w[analysis action rationale confidence]
     }
   }.freeze
 
@@ -69,7 +82,7 @@ class Strategy
     }
 
     t, usage, model = request(body)
-    confidence = t["confidence"].to_f
+    confidence = t["confidence"].to_f.clamp(0.0, 1.0)
     @log.("strategy: #{t['action']} (confidence #{confidence}) [in #{usage&.dig('input_tokens')} out #{usage&.dig('output_tokens')} tok]")
 
     @transcript&.record("claude_call",
@@ -118,6 +131,12 @@ class Strategy
       you never need to be more conservative than the two rules above. Never propose a symbol
       that is not in the candidate list, is already held, is in cool-down, or whose sector is
       flagged at its cap. Position size, price, and stop placement are set by the system.
+
+      Fill in `analysis` FIRST, before `action`. Work the candidates in it; only once that's
+      done, set action/symbol to whatever `analysis` actually concluded. If partway through
+      `analysis` you realize your first guess was wrong, that's fine - just make sure the
+      symbol you finally submit is the one your own analysis says qualifies, not the one you
+      started with.
 
       STRATEGY PARAMETERS (config/strategy.yml):
       #{JSON.pretty_generate(@config.strategy)}

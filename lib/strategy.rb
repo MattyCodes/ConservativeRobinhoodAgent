@@ -17,8 +17,9 @@ class Strategy
   Proposal = Struct.new(:symbol, :rationale, :confidence, keyword_init: true)
 
   # Always returned by #propose. `closest_miss` (on no_trade) says how close the best candidate
-  # got; `usage`/`model`/`raw` carry the API accounting and Claude's exact tool input.
-  Outcome = Struct.new(:action, :proposal, :closest_miss, :confidence, :usage, :model, :raw,
+  # got; `usage`/`model`/`raw` carry the API accounting and Claude's exact tool input; `retried`
+  # is true if the first response came back malformed and a second call was made (see #propose).
+  Outcome = Struct.new(:action, :proposal, :closest_miss, :confidence, :usage, :model, :raw, :retried,
                        keyword_init: true) do
     def enter?
       action == "enter" && !proposal.nil?
@@ -42,7 +43,7 @@ class Strategy
       type: "object",
       additionalProperties: false,
       properties: {
-        analysis: { type: "string", description: "REQUIRED FIRST. Before deciding anything: check the 3-5 candidates with the best rank_score against both entry rules, explicitly, with their exact numbers, one by one. State pass/fail for each against each rule. Do this completely before writing anything below - action and symbol must be the conclusion of this analysis, never a preliminary guess you reasoned your way out of. Plain prose only: end it once your conclusion is reached, do not restate action/symbol/rationale/confidence as tags or any other markup inside this string - they belong only in their own fields below." },
+        analysis: { type: "string", description: "REQUIRED FIRST. Before deciding anything: check the 3-5 candidates with the best rank_score against both entry rules, explicitly, with their exact numbers, one by one. State pass/fail for each against each rule. Do this completely before writing anything below - action and symbol must be the conclusion of this analysis, never a preliminary guess you reasoned your way out of. Plain prose only: STOP as soon as your conclusion is reached. Never write anything resembling a tag or a tool-call parameter inside this string - not <action>enter</action>, not <symbol>XYZ</symbol>, not <parameter name=\"symbol\">XYZ</parameter>, nothing in angle brackets at all. action/symbol/rationale/confidence/closest_miss are separate fields below that you fill in independently after analysis ends - they are not copied out of anything written here." },
         action: { type: "string", enum: %w[enter no_trade], description: "Must match the conclusion of `analysis` exactly. If `analysis` found a qualifying candidate, this is enter with that symbol - never no_trade." },
         symbol: { type: "string", description: "Ticker to buy; required when action=enter. Must be the candidate `analysis` concluded qualifies." },
         rationale: { type: "string", description: "Concise restatement of the analysis conclusion: which rule is met (enter) or why nothing qualified (no_trade), with the numbers." },
@@ -67,7 +68,7 @@ class Strategy
   def propose(candidates:, portfolio:)
     if candidates.empty?
       return Outcome.new(action: "no_trade", proposal: nil, closest_miss: "", confidence: 1.0,
-                         usage: nil, model: nil, raw: nil)
+                         usage: nil, model: nil, raw: nil, retried: false)
     end
 
     system = system_prompt
@@ -82,24 +83,48 @@ class Strategy
     }
 
     t, usage, model = request(body)
+    retried = false
+    if malformed?(t)
+      @log.("strategy: malformed tool response (action=#{t['action'].inspect} symbol=#{t['symbol'].inspect}) - retrying once")
+      t, usage, model = request(body)
+      retried = true
+    end
+
     confidence = t["confidence"].to_f.clamp(0.0, 1.0)
-    @log.("strategy: #{t['action']} (confidence #{confidence}) [in #{usage&.dig('input_tokens')} out #{usage&.dig('output_tokens')} tok]")
+    @log.("strategy: #{t['action']} (confidence #{confidence}) [in #{usage&.dig('input_tokens')} out #{usage&.dig('output_tokens')} tok]#{' [retried]' if retried}")
 
     @transcript&.record("claude_call",
                         model: model, usage: usage, response: t,
-                        system: system, user: user)
+                        system: system, user: user, retried: retried)
 
     if t["action"] == "enter" && !t["symbol"].to_s.empty?
       proposal = Proposal.new(symbol: t["symbol"].strip.upcase, rationale: t["rationale"].to_s, confidence: confidence)
       Outcome.new(action: "enter", proposal: proposal, closest_miss: "", confidence: confidence,
-                  usage: usage, model: model, raw: t)
+                  usage: usage, model: model, raw: t, retried: retried)
     else
       Outcome.new(action: "no_trade", proposal: nil, closest_miss: t["closest_miss"].to_s, confidence: confidence,
-                  usage: usage, model: model, raw: t)
+                  usage: usage, model: model, raw: t, retried: retried)
     end
   end
 
   private
+
+  # Sanity-checks the model's real `symbol` field against a plain ticker shape (1-6 letters,
+  # optional .letter share-class suffix e.g. BRK.B). Guards against an observed failure mode
+  # where Claude's structured fields get corrupted by leaked tool-call-like tokens (seen live:
+  # symbol came back as "EBAY</ANT:PARAMETER>") or dropped outright while `action` still said
+  # "enter" (seen live: action=enter, symbol=nil) - both correlated with a long `analysis`
+  # field echoing a second, informal copy of the answer as pseudo-tags. Both cases silently
+  # cost a real, rule-qualifying entry before this guard existed. One retry recovers the
+  # decision; strict:true does not catch this because a garbled or missing string still
+  # satisfies the JSON schema.
+  def malformed?(t)
+    t["action"] == "enter" && !valid_symbol?(t["symbol"])
+  end
+
+  def valid_symbol?(sym)
+    sym.to_s.strip.upcase.match?(/\A[A-Z]{1,6}(\.[A-Z]{1,2})?\z/)
+  end
 
   def system_prompt
     <<~TXT

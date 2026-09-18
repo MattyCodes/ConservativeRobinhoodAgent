@@ -259,7 +259,8 @@ class Agent
     @run_meta[:claude_model] = outcome.model
     @journal.record("claude_call", action: outcome.action, confidence: outcome.confidence,
                                    symbol: outcome.proposal&.symbol, closest_miss: outcome.closest_miss,
-                                   usage: outcome.usage, model: outcome.model, raw: outcome.raw)
+                                   usage: outcome.usage, model: outcome.model, raw: outcome.raw,
+                                   retried: outcome.retried)
 
     unless outcome.enter?
       miss = outcome.closest_miss.to_s.strip

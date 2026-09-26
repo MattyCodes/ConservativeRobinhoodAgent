@@ -14,11 +14,19 @@ require "uri"
 class Strategy
   ENDPOINT = URI("https://api.anthropic.com/v1/messages")
 
+  # Total attempts (1 original + up to 2 retries) before accepting a still-malformed response.
+  # One retry alone was observed to fail twice in a row in practice (both attempts malformed) -
+  # this is a per-call model glitch, not a deterministic prompt issue, so spending two extra
+  # ~100s calls on the rare bad-luck case is cheap insurance against a silently lost entry once
+  # real money is on the line.
+  MAX_ATTEMPTS = 3
+
   Proposal = Struct.new(:symbol, :rationale, :confidence, keyword_init: true)
 
   # Always returned by #propose. `closest_miss` (on no_trade) says how close the best candidate
   # got; `usage`/`model`/`raw` carry the API accounting and Claude's exact tool input; `retried`
-  # is true if the first response came back malformed and a second call was made (see #propose).
+  # is true if the first response came back malformed and at least one more call was made (see
+  # #propose).
   Outcome = Struct.new(:action, :proposal, :closest_miss, :confidence, :usage, :model, :raw, :retried,
                        keyword_init: true) do
     def enter?
@@ -83,12 +91,13 @@ class Strategy
     }
 
     t, usage, model = request(body)
-    retried = false
-    if malformed?(t)
-      @log.("strategy: malformed tool response (action=#{t['action'].inspect} symbol=#{t['symbol'].inspect}) - retrying once")
+    attempts = 1
+    while malformed?(t) && attempts < MAX_ATTEMPTS
+      attempts += 1
+      @log.("strategy: malformed tool response (action=#{t['action'].inspect} symbol=#{t['symbol'].inspect}) - retrying (attempt #{attempts}/#{MAX_ATTEMPTS})")
       t, usage, model = request(body)
-      retried = true
     end
+    retried = attempts > 1
 
     confidence = t["confidence"].to_f.clamp(0.0, 1.0)
     @log.("strategy: #{t['action']} (confidence #{confidence}) [in #{usage&.dig('input_tokens')} out #{usage&.dig('output_tokens')} tok]#{' [retried]' if retried}")

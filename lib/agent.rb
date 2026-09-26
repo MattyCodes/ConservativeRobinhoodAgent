@@ -42,31 +42,38 @@ class Agent
     @git_rev = nil
   end
 
-  def initialize(config)
+  # Every collaborator is overridable (all nil by default, building the real thing exactly as
+  # before) so specs can substitute fakes at the McpClient/HTTP boundary without touching real
+  # Robinhood/Claude endpoints or the real log/ files. See spec/agent_spec.rb.
+  def initialize(config, mcp: nil, market_data: nil, paper: nil, transcript: nil, broker: nil,
+                 universe: nil, strategy: nil, guardrails: nil, notifier: nil, approval: nil,
+                 journal: nil, log_path: nil)
     @c = config
-    @journal = Journal.new(File.join(Config::ROOT, "log", "journal.jsonl"))
+    @journal = journal || Journal.new(File.join(Config::ROOT, "log", "journal.jsonl"))
+    @log_path = log_path || File.join(Config::ROOT, "log", "run.log")
     @log = method(:log)
 
-    @mcp = McpClient.new(url: @c.mcp_url, logger: @log)
-    @md = MarketData.new(@mcp)
+    @mcp = mcp || McpClient.new(url: @c.mcp_url, logger: @log)
+    @md = market_data || MarketData.new(@mcp)
 
     # DRY-RUN: a paper portfolio stands in for the broker so the strategy's full lifecycle
     # (concurrent limits, sector caps, cool-downs, trailing stops, time exits, P&L) is exercised.
     @paper =
+      paper ||
       if @c.dry_run?
         PaperLedger.new(Journal.new(File.join(Config::ROOT, "log", "paper.jsonl")),
                         start_usd: @c.paper_start_usd,
                         quote_fn: ->(sym) { @md.quote(sym)[:price] })
       end
 
-    @transcript = Journal.new(File.join(Config::ROOT, "log", "claude_calls.jsonl"))
+    @transcript = transcript || Journal.new(File.join(Config::ROOT, "log", "claude_calls.jsonl"))
 
-    @broker = Broker.new(@c, @mcp, logger: @log, paper: @paper)
-    @universe = Universe.new(@c, @md, @journal, logger: @log)
-    @strategy = Strategy.new(@c, logger: @log, transcript: @transcript)
-    @guardrails = Guardrails.new(@c)
-    @notifier = Notifier.new(@c, logger: @log)
-    @approval = Approval.new(@c, logger: @log)
+    @broker = broker || Broker.new(@c, @mcp, logger: @log, paper: @paper)
+    @universe = universe || Universe.new(@c, @md, @journal, logger: @log)
+    @strategy = strategy || Strategy.new(@c, logger: @log, transcript: @transcript)
+    @guardrails = guardrails || Guardrails.new(@c)
+    @notifier = notifier || Notifier.new(@c, logger: @log)
+    @approval = approval || Approval.new(@c, logger: @log)
   end
 
   # scan_for_entry: false runs a lightweight position-management-only pass - stop checks,
@@ -538,7 +545,7 @@ class Agent
   def log(msg)
     line = "#{Time.now.strftime('%Y-%m-%d %H:%M:%S')} #{msg}"
     puts line
-    File.open(File.join(Config::ROOT, "log", "run.log"), "a") { |f| f.puts(line) }
+    File.open(@log_path, "a") { |f| f.puts(line) }
   end
 
   def num(v)

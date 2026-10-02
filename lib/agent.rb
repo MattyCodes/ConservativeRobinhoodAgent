@@ -253,7 +253,7 @@ class Agent
                   candidates_dropped: meta[:dropped].size }
     @journal.record("candidates", eligible_count: meta[:eligible_count],
                                   dropped: meta[:dropped], ranked_tail: meta[:ranked_tail],
-                                  analyzed: candidates)
+                                  sectors_full: meta[:sectors_full], analyzed: candidates)
 
     if candidates.empty?
       @journal.record("no_trade", why: "no candidates after screen/exclusions")
@@ -267,7 +267,7 @@ class Agent
     @journal.record("claude_call", action: outcome.action, confidence: outcome.confidence,
                                    symbol: outcome.proposal&.symbol, closest_miss: outcome.closest_miss,
                                    usage: outcome.usage, model: outcome.model, raw: outcome.raw,
-                                   retried: outcome.retried)
+                                   retried: outcome.retried, attempts: outcome.attempts)
 
     unless outcome.enter?
       miss = outcome.closest_miss.to_s.strip
@@ -381,15 +381,19 @@ class Agent
   end
 
   # Returns [analyzed, meta] where analyzed is the top-N ranked candidates with full technicals
-  # (fetch-failures removed) and meta = { eligible_count:, dropped: [syms], ranked_tail: [...] }.
+  # (fetch-failures removed) and meta = { eligible_count:, dropped: [syms], ranked_tail: [...],
+  # sectors_full: [...] }.
   def screened_candidates(portfolio)
     excluded = (portfolio[:open_symbols] + portfolio[:cooldown_symbols]).to_set
-    full = @c.s(:sizing, :max_sector_pct)
-    capped_sectors = portfolio[:sector_exposure]
-                     .select { |_, v| v >= portfolio[:funded_balance] * full / 100.0 }.keys.to_set
 
+    # Keep Claude away from sectors that can't take a new entry of the size we'd actually place
+    # (Guardrails#sector_full? is the same check #evaluate applies), so it never spends a pass
+    # proposing a name that must then be blocked.
+    sectors_full = Set.new
     eligible = @universe.eligible.reject do |cand|
-      excluded.include?(cand.symbol) || capped_sectors.include?(cand.sector)
+      full = @guardrails.sector_full?(cand.sector, portfolio)
+      sectors_full << cand.sector if full
+      excluded.include?(cand.symbol) || full
     end
 
     # Cheap pre-rank (uses fundamentals already fetched for the whole screen) so the expensive
@@ -416,7 +420,8 @@ class Agent
         pct_below_52w_high: pct_below_high(cand.fundamentals[:week_52_high], cand.fundamentals[:price]) }
     end
 
-    [analyzed, { eligible_count: eligible.size, dropped: dropped, ranked_tail: tail }]
+    [analyzed, { eligible_count: eligible.size, dropped: dropped, ranked_tail: tail,
+                 sectors_full: sectors_full.to_a.sort }]
   end
 
   # Distance of the 52-week drawdown from PULLBACK_TARGET; lower = closer to a healthy pullback.

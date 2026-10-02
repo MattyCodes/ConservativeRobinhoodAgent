@@ -115,4 +115,37 @@ describe Strategy do
     end
     _(calls).must_equal 1
   end
+
+  it "tells Claude what was wrong with its last answer on a retry, not on the first attempt" do
+    bodies = []
+    responses = [claude_malformed(symbol: nil), claude_malformed(symbol: "EBAY</ANT:PARAMETER>"), claude_enter("EBAY")]
+    fake = lambda do |body|
+      bodies << body
+      [responses.shift, { "input_tokens" => 1, "output_tokens" => 1 }, "test-model"]
+    end
+    @strategy.stub(:request, fake) do
+      @strategy.propose(candidates: one_candidate(symbol: "EBAY"), portfolio: {})
+    end
+
+    users = bodies.map { |b| b[:messages].first[:content] }
+    _(users.size).must_equal 3
+    _(users[0]).wont_match(/CORRECTION/)
+    _(users[1]).must_match(/CORRECTION/)
+    _(users[1]).must_match(/was missing/)
+    _(users[2]).must_match(/was "EBAY<\/ANT:PARAMETER>"/)
+    # the retry is the original request plus the note - same system prompt, tools, forced tool
+    _(users[1]).must_include users[0]
+    _(bodies.map { |b| b[:system] }.uniq.size).must_equal 1
+    _(bodies.map { |b| b[:tool_choice] }.uniq).must_equal [{ type: "tool", name: "propose_trade" }]
+  end
+
+  it "reports how many attempts the call took" do
+    stub_strategy_requests(@strategy, claude_malformed(symbol: nil), claude_enter("AAPL")) do
+      _(@strategy.propose(candidates: one_candidate, portfolio: {}).attempts).must_equal 2
+    end
+    stub_strategy_requests(@strategy, claude_enter("AAPL")) do
+      _(@strategy.propose(candidates: one_candidate, portfolio: {}).attempts).must_equal 1
+    end
+    _(@strategy.propose(candidates: [], portfolio: {}).attempts).must_equal 0
+  end
 end

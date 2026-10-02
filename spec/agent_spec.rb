@@ -34,23 +34,59 @@ describe Agent do
     _(agent.summary.join).must_match(/AAPL/)
   end
 
-  it "blocks the entry when it would push a sector over its cap, even though Claude proposed it" do
-    symbols = {
-      "MSFT" => trend_pullback_row(price: 300.0), # existing IT position
-      "KEYS" => trend_pullback_row(price: 330.0) # candidate, also IT - otherwise clean
+  it "still blocks an entry that fails a guardrail Claude didn't catch (earnings blackout)" do
+    agent, _mcp, paper, strategy, = build_agent(symbols: { "AAPL" => trend_pullback_row(price: 105.0, earnings_days: 1) })
+    stub_strategy_requests(strategy, claude_enter("AAPL")) { agent.run(scan_for_entry: true) }
+
+    _(paper.open?("AAPL")).must_equal false
+    _(agent.summary.join).must_match(/blocked AAPL/)
+    _(agent.summary.join).must_match(/earnings blackout/)
+  end
+
+  # A $200 MMM position on a $1000 book leaves an Industrials sector (cap $250) too little room
+  # for the ~$100 entry a new Industrials name would get - so it should never reach Claude.
+  def sector_full_symbols
+    {
+      "MMM" => trend_pullback_row(price: 150.0), # held, Industrials
+      "NSC" => trend_pullback_row(price: 300.0), # candidate, Industrials
+      "AAPL" => trend_pullback_row(price: 105.0) # candidate, Information Technology
     }
-    agent, _mcp, paper, strategy, paper_journal = build_agent(symbols: symbols)
-    # Pre-existing MSFT position worth ~$240 of a $1000 book - 24% of the 25% IT sector cap,
-    # leaving only $10 of room, well under the ~$100 a fresh entry would need.
-    paper_journal.record("paper_opened", symbol: "MSFT", entry_price: 300.0, dollar_amount: 240.0,
-                                        quantity: 0.8, stop_price: 279.0, sector: "Information Technology",
+  end
+
+  def hold_mmm(paper_journal)
+    paper_journal.record("paper_opened", symbol: "MMM", entry_price: 150.0, dollar_amount: 200.0,
+                                        quantity: 1.3333, stop_price: 139.5, sector: "Industrials",
                                         order_type: "market")
+  end
 
-    stub_strategy_requests(strategy, claude_enter("KEYS")) { agent.run(scan_for_entry: true) }
+  it "keeps candidates in a sector with no room for a full-size entry away from Claude" do
+    agent, _mcp, _paper, strategy, paper_journal = build_agent(symbols: sector_full_symbols)
+    hold_mmm(paper_journal)
 
-    _(paper.open?("KEYS")).must_equal false
-    _(agent.summary.join).must_match(/blocked KEYS/)
-    _(agent.summary.join).must_match(/sector/)
+    seen = nil
+    no_trade = lambda do |candidates:, portfolio:|
+      seen = candidates.map { |c| c[:symbol] }
+      Strategy::Outcome.new(action: "no_trade", proposal: nil, closest_miss: "", confidence: 0.5,
+                            retried: false, attempts: 1)
+    end
+    strategy.stub(:propose, no_trade) { agent.run(scan_for_entry: true) }
+
+    _(seen).must_equal ["AAPL"]
+    event = agent.instance_variable_get(:@journal).events.find { |e| e["event"] == "candidates" }
+    _(event["sectors_full"]).must_equal ["Industrials"]
+  end
+
+  it "doesn't call Claude at all when every candidate's sector is full" do
+    symbols = sector_full_symbols.reject { |sym, _| sym == "AAPL" }
+    agent, _mcp, paper, strategy, paper_journal = build_agent(symbols: symbols)
+    hold_mmm(paper_journal)
+
+    strategy.stub(:propose, ->(**) { raise "Strategy#propose should not have been called" }) do
+      agent.run(scan_for_entry: true)
+    end
+
+    _(paper.open?("NSC")).must_equal false
+    _(agent.summary.join).must_match(/no eligible candidates/)
   end
 
   it "recovers a real entry after Claude's response comes back malformed once" do
@@ -62,6 +98,9 @@ describe Agent do
     ) { agent.run(scan_for_entry: true) }
 
     _(paper.open?("EBAY")).must_equal true
+    claude_call = agent.instance_variable_get(:@journal).events.find { |e| e["event"] == "claude_call" }
+    _(claude_call["retried"]).must_equal true
+    _(claude_call["attempts"]).must_equal 2
   end
 
   it "rejects an off-list symbol without placing anything, if malformed persists through every retry" do

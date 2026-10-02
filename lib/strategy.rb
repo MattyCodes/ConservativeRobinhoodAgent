@@ -26,9 +26,9 @@ class Strategy
   # Always returned by #propose. `closest_miss` (on no_trade) says how close the best candidate
   # got; `usage`/`model`/`raw` carry the API accounting and Claude's exact tool input; `retried`
   # is true if the first response came back malformed and at least one more call was made (see
-  # #propose).
+  # #propose); `attempts` is how many API calls it took (0 when no call was needed).
   Outcome = Struct.new(:action, :proposal, :closest_miss, :confidence, :usage, :model, :raw, :retried,
-                       keyword_init: true) do
+                       :attempts, keyword_init: true) do
     def enter?
       action == "enter" && !proposal.nil?
     end
@@ -76,7 +76,7 @@ class Strategy
   def propose(candidates:, portfolio:)
     if candidates.empty?
       return Outcome.new(action: "no_trade", proposal: nil, closest_miss: "", confidence: 1.0,
-                         usage: nil, model: nil, raw: nil, retried: false)
+                         usage: nil, model: nil, raw: nil, retried: false, attempts: 0)
     end
 
     system = system_prompt
@@ -94,8 +94,8 @@ class Strategy
     attempts = 1
     while malformed?(t) && attempts < MAX_ATTEMPTS
       attempts += 1
-      @log.("strategy: malformed tool response (action=#{t['action'].inspect} symbol=#{t['symbol'].inspect}) - retrying (attempt #{attempts}/#{MAX_ATTEMPTS})")
-      t, usage, model = request(body)
+      @log.("strategy: malformed tool response (action=#{t['action'].inspect} symbol=#{t['symbol'].inspect}) - retrying with correction (attempt #{attempts}/#{MAX_ATTEMPTS})")
+      t, usage, model = request(corrective_body(body, user, t))
     end
     retried = attempts > 1
 
@@ -104,15 +104,15 @@ class Strategy
 
     @transcript&.record("claude_call",
                         model: model, usage: usage, response: t,
-                        system: system, user: user, retried: retried)
+                        system: system, user: user, retried: retried, attempts: attempts)
 
     if t["action"] == "enter" && !t["symbol"].to_s.empty?
       proposal = Proposal.new(symbol: t["symbol"].strip.upcase, rationale: t["rationale"].to_s, confidence: confidence)
       Outcome.new(action: "enter", proposal: proposal, closest_miss: "", confidence: confidence,
-                  usage: usage, model: model, raw: t, retried: retried)
+                  usage: usage, model: model, raw: t, retried: retried, attempts: attempts)
     else
       Outcome.new(action: "no_trade", proposal: nil, closest_miss: t["closest_miss"].to_s, confidence: confidence,
-                  usage: usage, model: model, raw: t, retried: retried)
+                  usage: usage, model: model, raw: t, retried: retried, attempts: attempts)
     end
   end
 
@@ -124,8 +124,8 @@ class Strategy
   # symbol came back as "EBAY</ANT:PARAMETER>") or dropped outright while `action` still said
   # "enter" (seen live: action=enter, symbol=nil) - both correlated with a long `analysis`
   # field echoing a second, informal copy of the answer as pseudo-tags. Both cases silently
-  # cost a real, rule-qualifying entry before this guard existed. One retry recovers the
-  # decision; strict:true does not catch this because a garbled or missing string still
+  # cost a real, rule-qualifying entry before this guard existed. Retries (with a corrective
+  # note, see #corrective_body) recover the decision; strict:true does not catch this because a garbled or missing string still
   # satisfies the JSON schema.
   def malformed?(t)
     t["action"] == "enter" && !valid_symbol?(t["symbol"])
@@ -133,6 +133,21 @@ class Strategy
 
   def valid_symbol?(sym)
     sym.to_s.strip.upcase.match?(/\A[A-Z]{1,6}(\.[A-Z]{1,2})?\z/)
+  end
+
+  # Re-sending the identical prompt reproduced the same malformed response in 3 of 4 live
+  # retries (the failure tracks the prompt, so retries are not independent draws). Tell the model
+  # what was wrong with its last answer so the retry is a different request, not a re-roll.
+  def corrective_body(body, user, bad)
+    shown = bad["symbol"].nil? ? "missing" : bad["symbol"].to_s[0, 40].inspect
+    nudge = <<~TXT
+
+      CORRECTION: your previous answer to this exact request was unusable. It had action=enter, but the top-level
+      `symbol` field was #{shown}. Call propose_trade again. If a candidate qualifies, put its bare ticker
+      (letters only, copied from the candidate list, e.g. "AAPL") in the top-level `symbol` field itself - not just
+      inside `analysis` - with no tags or other markup anywhere. If none qualifies, use action=no_trade.
+    TXT
+    body.merge(messages: [{ role: "user", content: user + nudge }])
   end
 
   def system_prompt

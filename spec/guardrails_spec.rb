@@ -136,4 +136,51 @@ describe Guardrails do
     _(d.ok?).must_equal false
     _(d.violations.join).must_match(/below fractional minimum/)
   end
+
+  describe "#sector_full?" do
+    # funded 100, settled 80 -> a fresh entry is sized to $10 (10% position cap); sector cap $25.
+    def small_book(exposure)
+      default_portfolio_state(funded_balance: 100.0, settled_cash: 80.0,
+                              sector_exposure: { "Industrials" => exposure })
+    end
+
+    it "is false for a sector with plenty of room" do
+      _(@g.sector_full?("Industrials", small_book(10.0))).must_equal false
+    end
+
+    it "is false when the new entry lands exactly on the cap (evaluate allows exactly the cap)" do
+      _(@g.sector_full?("Industrials", small_book(15.0))).must_equal false
+    end
+
+    it "is true once the new entry would breach the cap, even though exposure is still under it" do
+      _(@g.sector_full?("Industrials", small_book(20.0))).must_equal true
+    end
+
+    it "is true for a sector at or over its cap" do
+      _(@g.sector_full?("Industrials", small_book(25.0))).must_equal true
+    end
+
+    it "is false for a sector with no exposure" do
+      _(@g.sector_full?("Energy", small_book(20.0))).must_equal false
+    end
+
+    it "uses the shrunken budget when today's deploy allowance is nearly spent" do
+      # start-of-day settled ~= 60 + 20 = 80 -> 25% = 20 allowed, 20 already spent -> $0 room today.
+      # (budget 0, so exposure 20 + 0 <= cap: the sector isn't the problem; the daily cap is.)
+      pf = default_portfolio_state(funded_balance: 100.0, settled_cash: 60.0, deployed_today: 20.0,
+                                   entries_today: 1, sector_exposure: { "Industrials" => 20.0 })
+      _(@g.sector_full?("Industrials", pf)).must_equal false
+    end
+
+    it "agrees with #evaluate: full exactly when an otherwise-clean entry gets a sector violation" do
+      tech = { price: 102.0, ema_fast: 100.0, ema_slow: 90.0, rsi: 55.0 }
+      [0.0, 10.0, 15.0, 15.01, 20.0, 24.99, 25.0, 30.0].each do |exposure|
+        pf = small_book(exposure)
+        d = @g.evaluate(candidate: candidate(sector: "Industrials", technicals: tech),
+                        quote: { ask: 102.0 }, portfolio: pf)
+        blocked_by_sector = d.violations.any? { |v| v.start_with?("sector Industrials") }
+        _(@g.sector_full?("Industrials", pf)).must_equal(blocked_by_sector, "exposure #{exposure}")
+      end
+    end
+  end
 end

@@ -68,6 +68,20 @@ class Guardrails
     Decision.new(ok: true, violations: [], order: order)
   end
 
+  # True when no entry in `sector` could pass the sector-cap check right now, so callers can keep
+  # such candidates away from Claude instead of letting it pick one that #evaluate must reject.
+  # Fractional mode: every entry is sized to the same symbol-independent budget, so this is exactly
+  # the `sector_now + notional > cap` test #size applies. Whole-share notionals depend on the
+  # symbol's price, so there it only flags a sector already at/over its cap.
+  def sector_full?(sector, portfolio)
+    funded = dec(portfolio[:funded_balance])
+    cap = funded * pct(@c.s(:sizing, :max_sector_pct))
+    now = dec(portfolio.dig(:sector_exposure, sector) || 0)
+    return true if now >= cap
+
+    fractional? && now + [entry_budget(portfolio).floor(2), 0].max > cap
+  end
+
   private
 
   # Trend-following OR mean-reversion, both requiring an intact up-trend (fast EMA above slow).
@@ -95,17 +109,7 @@ class Guardrails
   def size(symbol, sector, price, portfolio)
     funded = dec(portfolio[:funded_balance])
     settled = dec(portfolio[:settled_cash])
-
-    position_cap = funded * pct(@c.s(:sizing, :max_position_pct))
-
-    # Notional whose worst-case stop-out loss equals the per-trade risk budget.
-    risk_cap = funded * pct(@c.s(:sizing, :max_risk_per_trade_pct)) / pct(@c.s(:exit, :stop_loss_pct))
-
-    # Approximate start-of-day settled cash as what is left plus what was already committed today.
-    day_reference = settled + dec(portfolio[:deployed_today])
-    daily_room = day_reference * pct(@c.s(:pacing, :max_daily_deploy_pct)) - dec(portfolio[:deployed_today])
-
-    budget = [position_cap, risk_cap, daily_room, settled].min
+    budget = entry_budget(portfolio)
 
     order = fractional? ? build_fractional(symbol, sector, price, budget) : build_whole_share(symbol, sector, price, budget)
     return order if order[1].any? # [nil, violations]
@@ -120,6 +124,24 @@ class Guardrails
     v << "notional $#{o.notional} exceeds settled cash $#{settled.to_f.round(2)}" if dec(o.notional) > settled
 
     v.empty? ? [o, []] : [nil, v]
+  end
+
+  # The dollar budget for one new entry: the smallest of the position cap, the per-trade risk cap,
+  # what's left of today's deploy allowance, and settled cash. Independent of the symbol.
+  def entry_budget(portfolio)
+    funded = dec(portfolio[:funded_balance])
+    settled = dec(portfolio[:settled_cash])
+
+    position_cap = funded * pct(@c.s(:sizing, :max_position_pct))
+
+    # Notional whose worst-case stop-out loss equals the per-trade risk budget.
+    risk_cap = funded * pct(@c.s(:sizing, :max_risk_per_trade_pct)) / pct(@c.s(:exit, :stop_loss_pct))
+
+    # Approximate start-of-day settled cash as what is left plus what was already committed today.
+    day_reference = settled + dec(portfolio[:deployed_today])
+    daily_room = day_reference * pct(@c.s(:pacing, :max_daily_deploy_pct)) - dec(portfolio[:deployed_today])
+
+    [position_cap, risk_cap, daily_room, settled].min
   end
 
   def build_fractional(symbol, sector, price, budget)

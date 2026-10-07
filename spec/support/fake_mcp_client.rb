@@ -44,7 +44,7 @@ class FakeMcpClient
     when "get_equity_quotes" then quote_response(args.fetch(:symbols).first)
     when "get_equity_fundamentals" then fundamentals_response(args.fetch(:symbols))
     when "get_equity_technical_indicators"
-      indicator_response(args.fetch(:symbol), args.fetch(:type), args.fetch(:period))
+      indicator_response(args.fetch(:symbols), args.fetch(:type), args.fetch(:period))
     when "get_earnings_results" then earnings_response(args.fetch(:symbol))
     when "get_portfolio" then wrap(@portfolio)
     when "get_equity_positions" then wrap(@positions)
@@ -99,18 +99,24 @@ class FakeMcpClient
 
   # Both EMAs are requested as type="ema" with different `period` (50 vs 200); RSI is its own
   # type. There's no real ambiguity in practice since strategy.yml's ma_fast/ma_slow periods are
-  # always far apart - splitting at 100 is a safe generic threshold.
-  def indicator_response(symbol, type, period)
-    row = row_for(symbol) || {}
-    value =
-      if type == "rsi"
-        row[:rsi]
-      elsif period.to_i <= 100
-        row[:ema_fast]
-      else
-        row[:ema_slow]
-      end
-    wrap({ "indicators" => [{ "series" => [{ "value" => value }] }] })
+  # always far apart - splitting at 100 is a safe generic threshold. Matches the live tool's
+  # contract: `symbols` in (array), data.results[] out, one entry per symbol.
+  def indicator_response(symbols, type, period)
+    results = symbols.map do |symbol|
+      row = row_for(symbol) || {}
+      value =
+        if type == "rsi"
+          row[:rsi]
+        elsif period.to_i <= 100
+          row[:ema_fast]
+        else
+          row[:ema_slow]
+        end
+      { "symbol" => symbol, "interval" => "day", "bounds" => "regular",
+        "indicators" => [{ "type" => type, "params" => { "period" => period },
+                           "series" => [{ "begins_at" => "2026-10-06T00:00:00Z", "value" => value }] }] }
+    end
+    wrap({ "results" => results })
   end
 
   def earnings_response(symbol)

@@ -84,7 +84,7 @@ describe Guardrails do
   it "rejects a new entry at max concurrent positions" do
     tech = { price: 102.0, ema_fast: 100.0, ema_slow: 90.0, rsi: 55.0 }
     d = @g.evaluate(candidate: candidate(technicals: tech), quote: { ask: 102.0 },
-                    portfolio: default_portfolio_state(positions_count: 10))
+                    portfolio: default_portfolio_state(positions_count: build_config.s(:sizing, :max_concurrent_positions)))
     _(d.ok?).must_equal false
     _(d.violations.join).must_match(/max concurrent/)
   end

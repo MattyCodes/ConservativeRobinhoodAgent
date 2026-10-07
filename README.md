@@ -10,9 +10,10 @@ a terminal window you keep open (`ruby bin/watch.rb`).
 | Env | Default | Effect |
 |---|---|---|
 | `DRYRUN` | `true` | Everything runs except the order. `DRYRUN=false` to place real orders. |
-| `APPROVAL_MODE` | `confirm` | Every live order needs an SMS `YES <code>` reply. `notify` = fully autonomous. |
 
-Fully live = `DRYRUN=false APPROVAL_MODE=notify ruby bin/watch.rb`.
+Live = `DRYRUN=false ruby bin/watch.rb`. There is no per-order confirmation step: a live run places
+real orders on its own (Robinhood's own trade notifications are the heads-up). Keep `DRYRUN=true` in
+`.env` and pass `DRYRUN=false` on the command line only when you mean it.
 
 Always on: trade access is scoped by Robinhood to the one funded Agentic account; `HALT` file in
 the project root pauses all passes; `lib/guardrails.rb` is the authority on every order; sizing
@@ -49,7 +50,7 @@ Requires Ruby ≥ 3.1.
 - `lib/paper.rb` — dry-run paper portfolio so the full lifecycle (limits, cool-downs, stops, P&L) is simulated
 - `lib/mcp_client.rb` — MCP client + OAuth refresh + rate-limit backoff + call counters
 - `lib/market_data.rb` · `lib/universe.rb` — read-only Robinhood data + the eligibility screen
-- `lib/{journal,notifier,approval,config}.rb` — JSONL log, SMS, approval loop, config+validation
+- `lib/{journal,config}.rb` — JSONL log, config+validation
 
 ## Logs (`log/`, all gitignored)
 

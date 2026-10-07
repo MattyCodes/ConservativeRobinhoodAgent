@@ -13,8 +13,6 @@ require_relative "strategy"
 require_relative "guardrails"
 require_relative "broker"
 require_relative "paper"
-require_relative "notifier"
-require_relative "approval"
 
 # One scheduled pass:
 #   1. manage every open position (ensure a stop, ratchet the trailing stop, honor the time exit)
@@ -26,7 +24,7 @@ class Agent
   MAX_ANALYZE = 30      # how many pre-ranked candidates get full technicals + go to Claude
   PULLBACK_TARGET = 0.10 # rank names ~10% below their 52-wk high first (typical healthy pullback)
 
-  # The list of human-readable things that happened this run (also the digest SMS body).
+  # The list of human-readable things that happened this run.
   # Readable by bin/watch.rb after #run, even if #run raised.
   attr_reader :summary
 
@@ -46,8 +44,7 @@ class Agent
   # before) so specs can substitute fakes at the McpClient/HTTP boundary without touching real
   # Robinhood/Claude endpoints or the real log/ files. See spec/agent_spec.rb.
   def initialize(config, mcp: nil, market_data: nil, paper: nil, transcript: nil, broker: nil,
-                 universe: nil, strategy: nil, guardrails: nil, notifier: nil, approval: nil,
-                 journal: nil, log_path: nil)
+                 universe: nil, strategy: nil, guardrails: nil, journal: nil, log_path: nil)
     @c = config
     @journal = journal || Journal.new(File.join(Config::ROOT, "log", "journal.jsonl"))
     @log_path = log_path || File.join(Config::ROOT, "log", "run.log")
@@ -72,13 +69,10 @@ class Agent
     @universe = universe || Universe.new(@c, @md, @journal, logger: @log)
     @strategy = strategy || Strategy.new(@c, logger: @log, transcript: @transcript)
     @guardrails = guardrails || Guardrails.new(@c)
-    @notifier = notifier || Notifier.new(@c, logger: @log)
-    @approval = approval || Approval.new(@c, logger: @log)
   end
 
   # scan_for_entry: false runs a lightweight position-management-only pass - stop checks,
   # trailing-stop ratchets, the 30-day time exit - with NO universe screen and NO Claude call.
-  # It stays silent (no digest SMS) unless it actually closed a position or errored.
   def run(scan_for_entry: true)
     @summary = []
     @scan_for_entry = scan_for_entry
@@ -87,7 +81,7 @@ class Agent
     @run_meta = {}
     kind = scan_for_entry ? "full" : "stop_check"
 
-    @journal.record("scan_started", kind: kind, dry_run: @c.dry_run?, approval_mode: @c.approval_mode,
+    @journal.record("scan_started", kind: kind, dry_run: @c.dry_run?,
                                     fractional: fractional?, paper: !@paper.nil?,
                                     code_rev: self.class.git_rev, ruby: RUBY_VERSION,
                                     tuning: { max_analyze: MAX_ANALYZE, pullback_target: PULLBACK_TARGET,
@@ -109,25 +103,12 @@ class Agent
                                      duration_s: (Time.now - @started_at).round(2),
                                      mcp_calls: @mcp.call_count, rate_limit_retries: @mcp.rate_limit_hits,
                                      **(@run_meta || {}))
-    send_digest
+    @log.("stop-check: nothing to do") if @scan_for_entry == false && @summary.to_a.empty?
   end
 
-  # One SMS per full pass summarising everything that happened; a stop-check pass sends only
-  # when it acted. Immediate SMS is otherwise reserved for the approval request (confirm mode).
   def note(text)
     @log.(text)
     (@summary ||= []) << text
-  end
-
-  def send_digest
-    lines = @summary || []
-    if @scan_for_entry == false
-      @log.("stop-check: nothing to do") if lines.empty?
-      notify("stop-check:\n- #{lines.join("\n- ")}") unless lines.empty?
-      return
-    end
-    body = lines.empty? ? "run complete — no positions changed, no new entry" : "run complete:\n- #{lines.join("\n- ")}"
-    notify(body)
   end
 
   private
@@ -310,16 +291,7 @@ class Agent
                                        confidence: proposal.confidence,
                                        technicals: picked && picked[:technicals], review: review)
 
-    if @c.approval_mode == "confirm"
-      unless @approval.request_and_wait(summary, timeout_seconds: @c.approval_timeout_seconds)
-        @outcome = "approval_denied"
-        @journal.record("approval_denied", symbol: order.symbol)
-        note("not approved in time — #{order.symbol} skipped")
-        return
-      end
-    else
-      note("AUTO-PLACING (notify mode):\n#{summary}")
-    end
+    note("PLACING:\n#{summary}")
 
     # Reference entry price for later stop math (and the paper fill): the freshest quote,
     # falling back to the limit price or notional/qty.
@@ -537,14 +509,6 @@ class Agent
   def qfmt(q)
     f = q.to_f
     f == f.to_i ? f.to_i.to_s : format("%.6f", f).sub(/0+\z/, "")
-  end
-
-  def mode_label
-    "#{@c.dry_run? ? 'DRYRUN' : 'LIVE'}/#{@c.approval_mode}#{'/frac' if fractional?}"
-  end
-
-  def notify(text)
-    @notifier.notify("[CRA #{mode_label}] #{text}")
   end
 
   def log(msg)

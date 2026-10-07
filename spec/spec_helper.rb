@@ -44,12 +44,7 @@ module SpecHelpers
       "ANTHROPIC_API_KEY" => "test-key",
       "CLAUDE_MODEL" => "claude-sonnet-5",
       "ROBINHOOD_MCP_URL" => "https://example.invalid/mcp",
-      "TWILIO_ACCOUNT_SID" => "AC_test",
-      "TWILIO_AUTH_TOKEN" => "test-token",
-      "TWILIO_FROM_NUMBER" => "+10000000000",
-      "TWILIO_TO_NUMBER" => "+10000000000",
       "DRYRUN" => "true",
-      "APPROVAL_MODE" => "notify",
       "PAPER_START_USD" => "1000"
     }.merge(env_overrides)
     Config.new(env: env, strategy_path: File.join(ROOT, "config", "strategy.yml"))
@@ -79,13 +74,5 @@ module SpecHelpers
 
   def candidate(symbol: "TEST", sector: "Information Technology", technicals: {})
     { symbol: symbol, sector: sector, technicals: technicals }
-  end
-end
-
-# Notifier makes a real Twilio HTTP call - specs must never trigger that. Every Agent spec
-# injects this instead of a real Notifier.
-class NullNotifier
-  def notify(_text)
-    true
   end
 end

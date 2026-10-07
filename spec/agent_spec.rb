@@ -5,8 +5,7 @@ require_relative "spec_helper"
 # Integration-level behavioral specs: the real Agent, Guardrails, Broker, PaperLedger, Universe,
 # MarketData, and Strategy all run for real - only the two actual network boundaries are faked:
 # FakeMcpClient stands in for Robinhood, and Strategy#request (the Anthropic HTTP call) is
-# stubbed per-test via stub_strategy_requests. Notifier is replaced with a no-op so nothing ever
-# reaches Twilio either. Nothing here can reach a real external service.
+# stubbed per-test via stub_strategy_requests. Nothing here can reach a real external service.
 describe Agent do
   include SpecHelpers
 
@@ -22,7 +21,7 @@ describe Agent do
     strategy = Strategy.new(config, logger: ->(_msg) {}, transcript: tmp_journal("claude_calls"))
     agent = Agent.new(config, mcp: fake_mcp, paper: paper, journal: tmp_journal("journal"),
                       transcript: tmp_journal("claude_calls"), log_path: tmp_log_path,
-                      strategy: strategy, notifier: NullNotifier.new)
+                      strategy: strategy)
     [agent, fake_mcp, paper, strategy, paper_journal]
   end
 

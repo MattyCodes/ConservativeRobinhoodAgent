@@ -1,12 +1,11 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Entrypoint for one scheduled pass. Safe by default: with DRYRUN unset and APPROVAL_MODE unset
-# this screens, asks Claude, evaluates guardrails, and texts you — but places no orders.
+# Entrypoint for one scheduled pass. Safe by default: with DRYRUN unset this screens, asks Claude,
+# and evaluates guardrails, but places no orders (a paper portfolio stands in for the account).
 #
-#   ruby main.rb                                    # dry run, confirm mode
-#   DRYRUN=false ruby main.rb                       # live; every order needs an SMS reply
-#   DRYRUN=false APPROVAL_MODE=notify ruby main.rb  # fully autonomous (deliberate)
+#   ruby main.rb                 # dry run
+#   DRYRUN=false ruby main.rb    # live - places real orders, no confirmation step (deliberate)
 
 if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1")
   abort "Ruby >= 3.1 required (found #{RUBY_VERSION}). Install a current Ruby; the macOS system Ruby will not work."
@@ -29,7 +28,7 @@ end
 
 config = Config.new
 
-puts "ConservativeRobinhoodAgent — #{config.dry_run? ? 'DRYRUN' : 'LIVE'} / #{config.approval_mode} mode"
+puts "ConservativeRobinhoodAgent — #{config.dry_run? ? 'DRYRUN' : 'LIVE'}"
 
 begin
   Agent.new(config).run

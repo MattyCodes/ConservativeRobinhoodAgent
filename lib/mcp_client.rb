@@ -70,6 +70,21 @@ class McpClient
     end
   end
 
+  # Every tool the server currently offers, with its input/output JSON schemas (tools/list,
+  # following pagination). Used by Preflight to compare the agent's calls with the live contract.
+  def list_tools
+    ensure_initialized
+    tools = []
+    cursor = nil
+    loop do
+      result = rpc("tools/list", cursor ? { cursor: cursor } : {})
+      tools.concat(Array(result["tools"]))
+      cursor = result["nextCursor"]
+      break if cursor.nil? || cursor.empty?
+    end
+    tools
+  end
+
   private
 
   def ensure_initialized

@@ -94,16 +94,19 @@ class MarketData
     }
   end
 
+  # The tool takes `symbols` (an array, max 10) and returns data.results[] with one entry per
+  # symbol; we ask for one symbol at a time and pick that symbol's entry out of the results.
   def indicator(symbol, type:, period:)
     result = data(@client.call("get_equity_technical_indicators", {
-      symbol: symbol,
+      symbols: [symbol],
       type: type,
       interval: "day",
       period: period,
       start_time: (Time.now.utc - (60 * 60 * 24 * 800)).iso8601,
       output: "latest"
     }))
-    series = dig(Array(result["indicators"]).first || {}, "series") || []
+    row = Array(result["results"]).find { |r| r["symbol"] == symbol } || {}
+    series = dig(Array(row["indicators"]).first || {}, "series") || []
     num(dig(series.last || {}, "value"))
   end
 

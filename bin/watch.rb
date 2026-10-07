@@ -16,6 +16,7 @@
 #   MARKET_HOURS=09:30-16:00  local window the stop-check runs in (default 09:30-16:00)
 #   RUN_ON_START=false    skip the immediate full pass on startup (default: run once right away)
 #   DEBUG=1               verbose per-symbol screen logging
+#   SKIP_PREFLIGHT=true   start even if the startup contract check (lib/preflight.rb) finds drift
 
 if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1")
   abort "Ruby >= 3.1 required (found #{RUBY_VERSION})."
@@ -26,6 +27,7 @@ Encoding.default_external = Encoding::UTF_8
 Encoding.default_internal = Encoding::UTF_8
 
 require_relative "../lib/agent"
+require_relative "../lib/preflight"
 
 RUN_DAYS = (1..5).to_a          # Mon-Fri (Time#wday: 0 = Sunday)
 POLL_SECONDS = 30
@@ -152,12 +154,29 @@ SLOTS = parse_slots(ENV["RUN_AT"])
 STOP_CHECK_SECONDS = (ENV["STOP_CHECK_MINUTES"].to_s.strip.empty? ? 60 : ENV["STOP_CHECK_MINUTES"].to_i) * 60
 MARKET_WINDOW = parse_window(ENV["MARKET_HOURS"])
 
+# Refuse to run blind: if Robinhood changed a tool the agent depends on, every pass would fail (or
+# worse, quietly find nothing). An unreachable server is only a warning - passes will say so too.
+if ENV["SKIP_PREFLIGHT"] == "true"
+  say "preflight skipped (SKIP_PREFLIGHT=true)"
+else
+  pre = Preflight.check(McpClient.new(url: config.mcp_url))
+  if pre.unreachable
+    say "preflight: could not fetch the server's tool schemas (#{pre.unreachable}) - continuing unchecked"
+  elsif pre.ok?
+    say "preflight OK - #{pre.calls_checked} simulated calls and #{pre.tools_checked} tools' response fields match the server's schemas"
+  else
+    abort "preflight FOUND DRIFT between the agent and Robinhood's MCP tools - not starting:\n" \
+          "#{pre.problems.map { |p| "  - #{p}" }.join("\n")}\n" \
+          "(fix the code, or SKIP_PREFLIGHT=true to start anyway)"
+  end
+end
+
 claim_singleton!(File.join(Config::ROOT, "log", "watch.pid"))
 
 trap("INT")  { puts; say "stopping (Ctrl-C)."; exit 0 }
 trap("TERM") { exit 0 }
 
-say "watcher up - #{config.dry_run? ? 'DRYRUN' : 'LIVE'}/#{config.approval_mode}" \
+say "watcher up - #{config.dry_run? ? 'DRYRUN' : 'LIVE'}" \
     "#{'/frac' if config.s(:sizing, :fractional_shares)} - full pass at #{fmt_slots(SLOTS)} Mon-Fri" \
     "#{STOP_CHECK_SECONDS.positive? ? ", stop-check every #{STOP_CHECK_SECONDS / 60}m in #{fmt_window(MARKET_WINDOW)}" : ", stop-check disabled"}"
 say "next full pass: #{next_slot_time(SLOTS).strftime('%a %Y-%m-%d %H:%M')}"

@@ -15,7 +15,6 @@ class Config
   REQUIRED_ENV = %w[
     ANTHROPIC_API_KEY CLAUDE_MODEL
     ROBINHOOD_MCP_URL
-    TWILIO_ACCOUNT_SID TWILIO_AUTH_TOKEN TWILIO_FROM_NUMBER TWILIO_TO_NUMBER
   ].freeze
 
   attr_reader :strategy
@@ -33,16 +32,6 @@ class Config
   def dry_run?
     v = @env["DRYRUN"]
     v.nil? || v.strip.empty? || v.strip.downcase != "false"
-  end
-
-  # Safe default: "confirm" requires a per-order SMS reply. "notify" is fully autonomous.
-  def approval_mode
-    v = (@env["APPROVAL_MODE"] || "").strip.downcase
-    v == "notify" ? "notify" : "confirm"
-  end
-
-  def approval_timeout_seconds
-    ((@env["APPROVAL_TIMEOUT_MINUTES"] || "15").to_i) * 60
   end
 
   # Paper-portfolio starting balance (dry-run only). Bigger = position sizing isn't the
@@ -68,15 +57,6 @@ class Config
 
   def account_number
     value_or_nil(@env["ROBINHOOD_ACCOUNT_NUMBER"])
-  end
-
-  def twilio
-    {
-      sid:  @env.fetch("TWILIO_ACCOUNT_SID"),
-      token: @env.fetch("TWILIO_AUTH_TOKEN"),
-      from: @env.fetch("TWILIO_FROM_NUMBER"),
-      to:   @env.fetch("TWILIO_TO_NUMBER")
-    }
   end
 
   # --- strategy shortcuts (all read-through to strategy.yml) ----------------
